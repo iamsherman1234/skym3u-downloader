@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
 Samkok 1080p Netflix Muxer & Google Drive Auto-Uploader
+Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Netflix 1080p WEB-DL (st.111477.xyz)
 Processes episodes sequentially with rock-solid auto-resuming downloads:
 1. Resolves fresh 1080p stream URL via st.111477.xyz
 2. Downloads 1080p video with curl auto-resumption (-C -) and retries
-3. Downloads Khmer AAC audio from OK.ru
-4. Remuxes losslessly into dual-audio 1080p MKV
+3. Downloads Khmer audio MP4 from TheKomsan (Rumble CDN) via aria2c/curl
+4. Extracts AAC audio and losslessly remuxes into dual-audio 1080p MKV with Chinese subtitles
 5. Uploads to Google Drive via rclone
 6. Cleans up temporary files to keep disk usage minimal (< 3 GB)
 """
@@ -15,7 +16,6 @@ import os
 import re
 import json
 import time
-import base64
 import argparse
 import subprocess
 import urllib.request
@@ -26,15 +26,20 @@ SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"  # https://a.111477.xyz/
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+AUDIO_SYNC_OFFSET = "0.940"  # Seconds to trim from Khmer audio for Netflix 1080p alignment
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
-    for p in [Path("samkok_khmer_episodes.json"), Path("/root/skym3u-downloader/samkok_khmer_episodes.json")]:
+    for p in [
+        Path("thekomsan_samkok_episodes.json"),
+        Path("/root/skym3u-downloader/thekomsan_samkok_episodes.json"),
+        Path("/content/skym3u-downloader/thekomsan_samkok_episodes.json")
+    ]:
         if p.exists():
             try:
                 return json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 pass
-    print("[-] Error: samkok_khmer_episodes.json not found.", file=sys.stderr)
+    print("[-] Error: thekomsan_samkok_episodes.json not found.", file=sys.stderr)
     return []
 
 def load_progress(state_file: Path) -> Dict[str, Any]:
@@ -63,25 +68,6 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(2)
     return None
 
-def resolve_okru_audio_stream(embed_url: str) -> Optional[str]:
-    try:
-        req = urllib.request.Request(embed_url, headers={"User-Agent": USER_AGENT})
-        html = urllib.request.urlopen(req, timeout=12).read().decode("utf-8", errors="ignore")
-        m = re.search(r'data-options=["\']([^"\']+)["\']', html)
-        if not m:
-            return None
-        raw_opt = m.group(1).replace("&quot;", '"')
-        data = json.loads(raw_opt)
-        videos = data.get("flashvars", {}).get("metadata", {}).get("videos", [])
-        for v in videos:
-            if v.get("name") in ["lowest", "mobile", "low"]:
-                return v.get("url")
-        if videos:
-            return videos[0].get("url")
-    except Exception as e:
-        print(f"[-] OK.ru stream resolution failed: {e}", file=sys.stderr)
-    return None
-
 def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000) -> bool:
     """Downloads a file using curl with auto-resume, retries, and rate recovery."""
     cmd = [
@@ -102,6 +88,34 @@ def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000
     proc = subprocess.run(cmd)
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
+def download_audio_mp4(url: str, output_path: Path) -> bool:
+    """Downloads TheKomsan MP4 via aria2c multi-connection for maximum speed, fallback to curl."""
+    if output_path.exists() and output_path.stat().st_size > 10000000:
+        return True
+    
+    # Try aria2c first for fast multi-segment download
+    try:
+        cmd = [
+            "aria2c",
+            "-x", "8",
+            "-s", "8",
+            "-k", "1M",
+            "-d", str(output_path.parent),
+            "-o", output_path.name,
+            "-U", USER_AGENT,
+            "--allow-overwrite=true",
+            "--summary-interval=5",
+            url
+        ]
+        proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 10000000:
+            return True
+    except FileNotFoundError:
+        pass
+
+    # Fallback to curl
+    return download_file_resilient(url, output_path, min_size=10000000)
+
 def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
     cmd = [
         "ffmpeg", "-y",
@@ -116,7 +130,7 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
-        "-ss", "1.364",
+        "-ss", AUDIO_SYNC_OFFSET,
         "-i", str(audio_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -126,13 +140,13 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
         "-c:a", "copy",
         "-c:s", "copy",
         "-metadata:s:a:0", "language=khm",
-        "-metadata:s:a:0", "title=Khmer Dubbed (Hang Meas)",
+        "-metadata:s:a:0", "title=Khmer Dubbed",
         "-metadata:s:a:1", "language=zho",
         "-metadata:s:a:1", "title=Original Mandarin",
         "-disposition:a:0", "default",
         "-disposition:a:1", "none",
         "-metadata", f"title=Three Kingdoms (2010) - Episode {ep_num:02d} [1080p Khmer Dubbed]",
-        "-t", "2605",
+        "-t", "2618",
         str(output_mkv)
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
@@ -157,7 +171,8 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Automated Pipeline (Episodes {start_ep} to {end_ep})")
     print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
-    print(f"🎙️  Khmer Audio Source: movie-khmer.com (AAC Stereo)")
+    print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
+    print(f"⏱️  Audio Sync Offset: -ss {AUDIO_SYNC_OFFSET}s (Verified)")
     if remote_dest:
         print(f"☁️  Google Drive Remote: {remote_dest}")
     print(f"{'='*80}\n")
@@ -171,7 +186,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
         ep_data = catalog[ep_num - 1]
 
         temp_raw_video = work_dir / f"raw_1080p_e{ep_num:02d}.mkv"
-        temp_audio_mp4 = work_dir / f"raw_audio_e{ep_num:02d}.mp4"
+        temp_audio_mp4 = work_dir / f"raw_komsan_e{ep_num:02d}.mp4"
         temp_khmer_aac = work_dir / f"khmer_audio_e{ep_num:02d}.aac"
         final_mkv = work_dir / f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
 
@@ -188,17 +203,16 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
-        # 2. Resolve & Extract Khmer Audio
-        print(f"[2/4] 🎙️ Extracting Khmer AAC audio from OK.ru...")
-        embed_url = ep_data.get("embed_url") or ep_data.get("source_url")
-        audio_stream_url = resolve_okru_audio_stream(embed_url)
+        # 2. Download TheKomsan Khmer Audio Stream
+        print(f"[2/4] 🎙️ Downloading Khmer audio from TheKomsan...")
+        audio_stream_url = ep_data.get("file")
         if not audio_stream_url:
-            print(f"[-] Could not resolve OK.ru audio stream for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+            print(f"[-] No audio URL found in catalog for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
-        print(f"    📥 Downloading audio stream (~35 MB)...")
-        if not download_file_resilient(audio_stream_url, temp_audio_mp4, min_size=1000000):
+        print(f"    📥 Downloading Khmer MP4 stream (~300 MB)...")
+        if not download_audio_mp4(audio_stream_url, temp_audio_mp4):
             print(f"[-] Audio stream download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
@@ -206,7 +220,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
         extract_aac_from_video(temp_audio_mp4, temp_khmer_aac)
         if temp_audio_mp4.exists(): temp_audio_mp4.unlink()
 
-        # 3. Losslessly Remux 1080p Video + Khmer Audio
+        # 3. Losslessly Remux 1080p Video + Khmer Audio + Mandarin + Subtitles
         print(f"[3/4] ⚡ Losslessly remuxing into 1080p Dual-Audio MKV...")
         mux_ok = remux_local_streams(temp_raw_video, temp_khmer_aac, final_mkv, ep_num)
         if temp_raw_video.exists(): temp_raw_video.unlink()

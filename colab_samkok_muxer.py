@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 Samkok 1080p Netflix Khmer Dub Muxer for Google Colab
+Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Netflix 1080p WEB-DL (st.111477.xyz)
 Seamlessly processes episodes in Google Colab:
 - Resolves 1080p Netflix stream from st.111477.xyz
-- Extracts Khmer AAC audio from OK.ru (movie-khmer.com)
-- Losslessly muxes into 1080p Dual Audio MKV
+- Extracts Khmer AAC audio from TheKomsan (Rumble CDN)
+- Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles
 - Saves directly into mounted Google Drive (/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer)
 """
 
@@ -23,12 +24,13 @@ SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+AUDIO_SYNC_OFFSET = "0.940"  # Seconds to trim from Khmer audio for Netflix 1080p alignment
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
     candidates = [
-        Path("samkok_khmer_episodes.json"),
-        Path("/content/skym3u-downloader/samkok_khmer_episodes.json"),
-        Path("/root/skym3u-downloader/samkok_khmer_episodes.json")
+        Path("thekomsan_samkok_episodes.json"),
+        Path("/content/skym3u-downloader/thekomsan_samkok_episodes.json"),
+        Path("/root/skym3u-downloader/thekomsan_samkok_episodes.json")
     ]
     for p in candidates:
         if p.exists():
@@ -36,7 +38,7 @@ def load_khmer_catalog() -> List[Dict[str, Any]]:
                 return json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 pass
-    url = "https://raw.githubusercontent.com/iamsherman1234/skym3u-downloader/main/samkok_khmer_episodes.json"
+    url = "https://raw.githubusercontent.com/iamsherman1234/skym3u-downloader/main/thekomsan_samkok_episodes.json"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
         data = json.loads(urllib.request.urlopen(req, timeout=10).read().decode("utf-8"))
@@ -58,25 +60,6 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
         except Exception as e:
             print(f"[-] Attempt {attempt+1} failed to resolve 1080p stream for E{ep_num:02d}: {e}")
             time.sleep(2)
-    return None
-
-def resolve_okru_audio_stream(embed_url: str) -> Optional[str]:
-    try:
-        req = urllib.request.Request(embed_url, headers={"User-Agent": USER_AGENT})
-        html = urllib.request.urlopen(req, timeout=12).read().decode("utf-8", errors="ignore")
-        m = re.search(r'data-options=["\']([^"\']+)["\']', html)
-        if not m:
-            return None
-        raw_opt = m.group(1).replace("&quot;", '"')
-        data = json.loads(raw_opt)
-        videos = data.get("flashvars", {}).get("metadata", {}).get("videos", [])
-        for v in videos:
-            if v.get("name") in ["lowest", "mobile", "low"]:
-                return v.get("url")
-        if videos:
-            return videos[0].get("url")
-    except Exception as e:
-        print(f"[-] OK.ru stream resolution failed: {e}", file=sys.stderr)
     return None
 
 def download_chunked_robust(url: str, output_path: Path, label: str = "File", min_size: int = 1000000, max_retries: int = 10) -> bool:
@@ -101,10 +84,11 @@ def download_chunked_robust(url: str, output_path: Path, label: str = "File", mi
                     total_size = downloaded + content_len
                     mode = "ab"
                 else:
-                    total_size = content_len
-                    downloaded = 0
+                    total_size = content_len if content_len > 0 else None
                     mode = "wb"
+                    downloaded = 0
 
+                last_print = time.time()
                 with open(output_path, mode) as f:
                     while True:
                         chunk = resp.read(block_size)
@@ -112,22 +96,23 @@ def download_chunked_robust(url: str, output_path: Path, label: str = "File", mi
                             break
                         f.write(chunk)
                         downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_print > 4:
+                            elapsed = now - start_time
+                            speed_mb = (downloaded / (1024 * 1024)) / (elapsed + 1e-5)
+                            if total_size and total_size > 0:
+                                pct = (downloaded / total_size) * 100
+                                print(f"    ⏳ [{label}] {downloaded / (1024*1024):.1f} / {total_size / (1024*1024):.1f} MB ({pct:.1f}%) - {speed_mb:.2f} MB/s", end="\r")
+                            else:
+                                print(f"    ⏳ [{label}] {downloaded / (1024*1024):.1f} MB downloaded - {speed_mb:.2f} MB/s", end="\r")
+                            last_print = now
 
-                        elapsed = time.time() - start_time
-                        speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                        if total_size > 0:
-                            pct = (downloaded / total_size) * 100
-                            mb = downloaded / (1024 * 1024)
-                            total_mb = total_size / (1024 * 1024)
-                            print(f"\r    [{label}] {mb:.1f}/{total_mb:.1f} MB ({pct:.1f}%) @ {speed:.2f} MB/s", end="", flush=True)
-                        else:
-                            mb = downloaded / (1024 * 1024)
-                            print(f"\r    [{label}] {mb:.1f} MB downloaded @ {speed:.2f} MB/s", end="", flush=True)
-                print()
-                if output_path.exists() and output_path.stat().st_size >= min_size:
-                    return True
+            print(f"\n    [+] [{label}] Download finished ({downloaded / (1024*1024):.1f} MB).")
+            if output_path.exists() and output_path.stat().st_size >= min_size:
+                return True
+
         except Exception as e:
-            print(f"\n[-] Download hiccup for {label} (attempt {attempt+1}/{max_retries}): {e}")
+            print(f"\n    [!] Connection error ({e}). Retrying ({attempt+1}/{max_retries})...")
             time.sleep(3)
 
     return output_path.exists() and output_path.stat().st_size >= min_size
@@ -142,11 +127,11 @@ def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode == 0 and output_aac.exists() and output_aac.stat().st_size > 500000
 
-def remux_dual_audio(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
+def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
-        "-ss", "1.364",
+        "-ss", AUDIO_SYNC_OFFSET,
         "-i", str(audio_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -156,70 +141,91 @@ def remux_dual_audio(video_path: Path, audio_path: Path, output_mkv: Path, ep_nu
         "-c:a", "copy",
         "-c:s", "copy",
         "-metadata:s:a:0", "language=khm",
-        "-metadata:s:a:0", "title=Khmer Dubbed (Hang Meas)",
+        "-metadata:s:a:0", "title=Khmer Dubbed",
         "-metadata:s:a:1", "language=zho",
         "-metadata:s:a:1", "title=Original Mandarin",
         "-disposition:a:0", "default",
         "-disposition:a:1", "none",
         "-metadata", f"title=Three Kingdoms (2010) - Episode {ep_num:02d} [1080p Khmer Dubbed]",
-        "-t", "2605",
+        "-t", "2618",
         str(output_mkv)
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 10000000
 
-def run_colab_pipeline(start_ep: int, end_ep: int, output_dir: Path, temp_dir: Path):
+def load_progress(state_file: Path) -> Dict[str, Any]:
+    if state_file.exists():
+        try:
+            return json.loads(state_file.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {"completed": []}
+
+def save_progress(state_file: Path, progress: Dict[str, Any]):
+    state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
+
+def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Path):
     catalog = load_khmer_catalog()
     if not catalog:
-        print("[-] Catalog could not be loaded. Exiting.", file=sys.stderr)
+        print("[-] Catalog is empty or could not be loaded.", file=sys.stderr)
         return
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    temp_dir.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    gdrive_dir.mkdir(parents=True, exist_ok=True)
+    state_file = gdrive_dir / "mux_state.json"
+    progress = load_progress(state_file)
 
     print(f"\n{'='*80}")
-    print(f"🚀 Google Colab Samkok 1080p Muxer (Episodes {start_ep} to {end_ep})")
-    print(f"📁 Destination: {output_dir}")
+    print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
+    print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
+    print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
+    print(f"📁 Output Target (GDrive): {gdrive_dir}")
     print(f"{'='*80}\n")
 
     for ep_num in range(start_ep, end_ep + 1):
-        final_filename = f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
-        final_mkv = output_dir / final_filename
+        if ep_num in progress["completed"]:
+            print(f"[✓] Episode {ep_num:02d} already completed. Skipping.")
+            continue
 
-        if final_mkv.exists() and final_mkv.stat().st_size > 500000000:
-            print(f"[✓] Episode {ep_num:02d} already exists on Google Drive ({final_mkv.stat().st_size / (1024*1024):.1f} MB). Skipping.")
+        target_name = f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
+        final_gdrive_path = gdrive_dir / target_name
+
+        if final_gdrive_path.exists() and final_gdrive_path.stat().st_size > 100000000:
+            print(f"[✓] File already exists on Google Drive ({target_name}). Skipping.")
+            progress["completed"].append(ep_num)
+            save_progress(state_file, progress)
             continue
 
         print(f"\n--- [ Processing Episode {ep_num:02d} / {end_ep:02d} ] ---")
         ep_data = catalog[ep_num - 1]
 
-        temp_raw_video = temp_dir / f"temp_1080p_e{ep_num:02d}.mkv"
-        temp_audio_mp4 = temp_dir / f"temp_audio_e{ep_num:02d}.mp4"
-        temp_khmer_aac = temp_dir / f"temp_khmer_e{ep_num:02d}.aac"
+        temp_raw_video = work_dir / f"raw_1080p_e{ep_num:02d}.mkv"
+        temp_audio_mp4 = work_dir / f"raw_komsan_e{ep_num:02d}.mp4"
+        temp_khmer_aac = work_dir / f"khmer_audio_e{ep_num:02d}.aac"
+        temp_final_mkv = work_dir / target_name
 
-        # 1. 1080p Video
-        print(f"[1/3] 🔍 Resolving 1080p stream for Episode {ep_num:02d}...")
-        v_url = resolve_1080p_stream_url(ep_num)
-        if not v_url:
-            print(f"[-] Could not resolve 1080p stream for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+        # 1. Resolve & Download 1080p Video Stream
+        print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
+        video_stream_url = resolve_1080p_stream_url(ep_num)
+        if not video_stream_url:
+            print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
+        print(f"    [+] 1080p Stream URL resolved.")
 
-        print(f"    📥 Downloading 1080p Netflix video (~2.4 GB)...")
-        if not download_chunked_robust(v_url, temp_raw_video, label=f"Video E{ep_num:02d}", min_size=50000000):
+        print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
+        if not download_chunked_robust(video_stream_url, temp_raw_video, label=f"Video E{ep_num:02d}", min_size=50000000):
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
-        # 2. Khmer Audio
-        print(f"[2/3] 🎙️ Resolving Khmer audio for Episode {ep_num:02d}...")
-        embed_url = ep_data.get("embed_url") or ep_data.get("source_url")
-        a_url = resolve_okru_audio_stream(embed_url)
-        if not a_url:
-            print(f"[-] Audio link resolution failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+        # 2. Download Khmer Audio Stream
+        print(f"[3/4] 🎙️ Downloading Khmer audio stream from TheKomsan...")
+        audio_stream_url = ep_data.get("file")
+        if not audio_stream_url:
+            print(f"[-] No audio URL found in catalog for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
-        print(f"    📥 Downloading audio stream (~35 MB)...")
-        if not download_chunked_robust(a_url, temp_audio_mp4, label=f"Audio E{ep_num:02d}", min_size=1000000):
+        if not download_chunked_robust(audio_stream_url, temp_audio_mp4, label=f"Khmer E{ep_num:02d}", min_size=10000000):
             print(f"[-] Audio download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
@@ -227,11 +233,9 @@ def run_colab_pipeline(start_ep: int, end_ep: int, output_dir: Path, temp_dir: P
         extract_aac_from_video(temp_audio_mp4, temp_khmer_aac)
         if temp_audio_mp4.exists(): temp_audio_mp4.unlink()
 
-        # 3. Losslessly Remux Directly to Google Drive
-        print(f"[3/3] ⚡ Losslessly remuxing directly into Google Drive: {final_mkv.name}...")
-        mux_ok = remux_dual_audio(temp_raw_video, temp_khmer_aac, final_mkv, ep_num)
-
-        # Cleanup local scratch files
+        # 3. Losslessly Remux 1080p Video + Khmer Audio + Mandarin + Subtitles
+        print(f"[4/4] ⚡ Losslessly remuxing into 1080p Dual-Audio MKV...")
+        mux_ok = remux_local_streams(temp_raw_video, temp_khmer_aac, temp_final_mkv, ep_num)
         if temp_raw_video.exists(): temp_raw_video.unlink()
         if temp_khmer_aac.exists(): temp_khmer_aac.unlink()
 
@@ -239,26 +243,33 @@ def run_colab_pipeline(start_ep: int, end_ep: int, output_dir: Path, temp_dir: P
             print(f"[-] Remuxing failed for Episode {ep_num:02d}.", file=sys.stderr)
             continue
 
-        size_mb = final_mkv.stat().st_size / (1024 * 1024)
-        print(f"[+] 🎉 Successfully saved to Google Drive: {final_mkv.name} ({size_mb:.1f} MB)!")
+        # Move to GDrive directly
+        print(f"[*] 🚀 Saving directly to Google Drive: {final_gdrive_path}")
+        temp_final_mkv.replace(final_gdrive_path)
 
+        # Mark episode completed
+        progress["completed"].append(ep_num)
+        save_progress(state_file, progress)
+        print(f"[✓] Episode {ep_num:02d} completed and saved!")
         time.sleep(2)
 
-    print(f"\n✨ All requested episodes completed successfully!")
+    print(f"\n🎉 All requested episodes successfully finished!")
 
 def main():
-    parser = argparse.ArgumentParser(description="Google Colab 1080p Samkok Khmer Dub Muxer")
-    parser.add_argument("-s", "--start", type=int, default=95, help="Start episode (default: 95)")
-    parser.add_argument("-e", "--end", type=int, default=95, help="End episode (default: 95)")
-    parser.add_argument("-o", "--output-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Destination folder in Google Drive")
-    parser.add_argument("-t", "--temp-dir", type=str, default="/content/temp_mux_work", help="Local temporary work folder in Colab")
+    parser = argparse.ArgumentParser(
+        description="Google Colab 1080p Netflix Three Kingdoms Khmer Dub Remuxer."
+    )
+    parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
+    parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
+    parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory")
+    parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
 
     args = parser.parse_args()
-    run_colab_pipeline(
+    process_pipeline(
         start_ep=args.start,
         end_ep=args.end,
-        output_dir=Path(args.output_dir),
-        temp_dir=Path(args.temp_dir)
+        gdrive_dir=Path(args.gdrive_dir),
+        work_dir=Path(args.work_dir)
     )
 
 if __name__ == "__main__":
