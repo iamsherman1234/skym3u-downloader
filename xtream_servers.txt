@@ -1,4 +1,5 @@
-www.skym3u.dev
+# SkyM3U All Discovered Servers History
+# Updated: 2026-09-13 15:47:30 UTC
 
 Server: http://uesztesm.ioiju.com:80
     ID: B35DKUNA
@@ -15,8 +16,3 @@ Server: http://portal5458.com:8080
 Server: http://globalstreamz.xyz:5050
     ID: joekir101@yahoo.com
   CODE: aY3fDdPG9x
-
-Server: 
-    ID: 
-  CODE: 
-  
