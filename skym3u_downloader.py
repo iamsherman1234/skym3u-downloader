@@ -94,16 +94,47 @@ def main():
         help="URL of the SkyM3U page to extract configuration from"
     )
 
+    parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Automatically test Xtream servers after downloading"
+    )
+
     args = parser.parse_args()
 
     print("[*] Fetching configuration from source page...")
     worker, token = fetch_live_credentials(args.url)
 
+    downloaded_files = []
     if args.type == "all":
-        download_file(worker, token, "xtream", "xtream_servers.txt")
-        download_file(worker, token, "bdix", "dedicated_ip.m3u")
+        f1 = download_file(worker, token, "xtream", "xtream_servers.txt")
+        f2 = download_file(worker, token, "bdix", "dedicated_ip.m3u")
+        if f1: downloaded_files.append(("xtream", f1))
+        if f2: downloaded_files.append(("bdix", f2))
     else:
-        download_file(worker, token, args.type, args.output)
+        f = download_file(worker, token, args.type, args.output)
+        if f: downloaded_files.append((args.type, f))
+
+    if args.test:
+        for ftype, fpath in downloaded_files:
+            if ftype == "xtream":
+                try:
+                    from xtream_tester import parse_xtream_file, test_single_server, print_results_table
+                    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+                    print(f"\n[*] Running automatic Xtream validation for '{fpath}'...")
+                    targets = parse_xtream_file(fpath)
+                    if targets:
+                        results = []
+                        with ThreadPoolExecutor(max_workers=5) as executor:
+                            future_to_acc = {executor.submit(test_single_server, acc, 6): acc for acc in targets}
+                            for future in as_completed(future_to_acc):
+                                results.append(future.result())
+                        results.sort(key=lambda x: (not (x["is_authenticated"] and x["status"].lower() == "active"), x["response_time_ms"]))
+                        print_results_table(results)
+                except ImportError:
+                    print("[!] xtream_tester module not found in path. Skipping test.")
 
 if __name__ == "__main__":
     main()
+

@@ -16,17 +16,44 @@ python3 skym3u_downloader.py
 ```
 *Output is saved to `xtream_servers.txt`.*
 
-### 2. Download All (Xtream + BDIX M3U Playlist)
+### 2. Download and Automatically Test Servers
+```bash
+python3 skym3u_downloader.py --test
+```
+
+### 3. Download All (Xtream + BDIX M3U Playlist)
 ```bash
 python3 skym3u_downloader.py --type all
 ```
 
-### 3. Download BDIX M3U Playlist Only
+### 4. Download BDIX M3U Playlist Only
 ```bash
 python3 skym3u_downloader.py --type bdix
 ```
 
-### 4. Custom Output Path
+---
+
+## Standalone Xtream Tester (`xtream_tester.py`)
+
+A fast, concurrent validator for Xtream Codes servers. Checks connectivity, auth credentials, active vs max connections, and subscription expiration.
+
+### Test a file of Xtream servers
 ```bash
-python3 skym3u_downloader.py --type xtream --output custom_name.txt
+python3 xtream_tester.py -f xtream_servers.txt
 ```
+
+### Test and Export only Active Servers
+```bash
+python3 xtream_tester.py -f xtream_servers.txt --export-active active_servers.txt
+```
+
+### Test a single server directly
+```bash
+python3 xtream_tester.py -s http://portal5458.com:8080 -u 552211 -p 552211
+```
+
+### Output in JSON format
+```bash
+python3 xtream_tester.py -f xtream_servers.txt --json
+```
+
