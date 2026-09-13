@@ -8,18 +8,35 @@ A lightweight, automated Python tool to fetch Xtream server lists and M3U playli
 - **Dynamic Configuration Extraction**: Automatically scrapes the latest backend worker endpoint and authentication tokens from the page.
 - **Multiple Download Modes**: Supports downloading Xtream server lists, BDIX M3U playlists, or both simultaneously.
 
-## Usage
+## 🚀 One-Command Workflow (Download + Test + Show Active Only)
 
-### 1. Download Xtream Server List (Default)
-```bash
-python3 skym3u_downloader.py
-```
-*Output is saved to `xtream_servers.txt`.*
+To automatically fetch without ads, test all servers concurrently, and display only working active servers:
 
-### 2. Download and Automatically Test Servers
 ```bash
-python3 skym3u_downloader.py --test
+python3 run.py
 ```
+
+### Useful Options:
+- **Quiet Mode** (Show only the verified results without progress logs):
+  ```bash
+  python3 run.py -q
+  ```
+- **Show All Servers** (Including expired/offline ones):
+  ```bash
+  python3 run.py -a
+  ```
+- **Output as JSON**:
+  ```bash
+  python3 run.py --json
+  ```
+- **Custom Export File**:
+  ```bash
+  python3 run.py -e my_working_servers.txt
+  ```
+
+---
+
+## Modular Usage
 
 ### 3. Download All (Xtream + BDIX M3U Playlist)
 ```bash
