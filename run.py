@@ -2,6 +2,7 @@
 """
 All-in-One SkyM3U Pipeline
 Downloads, validates, accumulates, and outputs active Xtream servers across runs.
+Preserves existing working servers across runs without dropping them on transient timeouts.
 """
 
 import sys
@@ -86,7 +87,11 @@ def update_raw_xtream_file(new_servers: List[Dict[str, str]], filepath: Path = P
     existing = parse_xtream_file(filepath) if filepath.exists() else []
     combined = merge_and_deduplicate(existing, new_servers)
     
-    lines = ["# SkyM3U All Discovered Servers History", f"# Updated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}", ""]
+    lines = [
+        "# SkyM3U All Discovered Servers History",
+        f"# Updated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
+        ""
+    ]
     for s in combined:
         lines.append(f"Server: {s['server']}")
         lines.append(f"    ID: {s['username']}")
@@ -108,7 +113,7 @@ def run_pipeline(
         raw_text = fetch_xtream_content(page_url, quiet=quiet)
         newly_scraped = parse_servers_from_text(raw_text)
     except Exception as e:
-        print(f"[-] Warning: Failed to fetch live SkyM3U page ({e}). Falling back to existing servers.", file=sys.stderr)
+        print(f"[-] Warning: Could not fetch live SkyM3U page ({e}). Evaluating existing accumulated servers.", file=sys.stderr)
         newly_scraped = []
 
     # 2. Collect existing servers from active_servers.txt and xtream_servers.txt if accumulating
@@ -123,6 +128,12 @@ def run_pipeline(
         if history_path.exists():
             existing_history = parse_xtream_file(history_path)
 
+    # Set of previously active server keys
+    prev_active_keys = {
+        (s["server"].lower().rstrip("/"), s["username"].strip(), s["password"].strip())
+        for s in existing_active
+    }
+
     # 3. Merge all server sources
     all_targets = merge_and_deduplicate(existing_active, existing_history, newly_scraped)
 
@@ -136,20 +147,30 @@ def run_pipeline(
     if not quiet:
         print(f"[3/3] ⚡ Validating {len(all_targets)} total server(s) ({len(newly_scraped)} new, {len(all_targets) - len(newly_scraped)} accumulated)...")
 
-    # 4. Test all servers concurrently
+    # 4. Test all servers concurrently with 10s timeout
     results = []
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        future_to_acc = {executor.submit(test_single_server, acc, 6): acc for acc in all_targets}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        future_to_acc = {executor.submit(test_single_server, acc, 10): acc for acc in all_targets}
         for future in as_completed(future_to_acc):
             results.append(future.result())
 
-    # Sort results: Active first, then lowest ping
-    results.sort(key=lambda x: (not (x["is_authenticated"] and x["status"].lower() == "active"), x["response_time_ms"]))
+    # Build active list: Keep verified active servers, and retain previously active servers if only transient network timeout occurred
+    final_active = []
+    for r in results:
+        key = (r["server"].lower().rstrip("/"), r["username"].strip(), r["password"].strip())
+        if r["is_authenticated"] and r["status"].lower() == "active":
+            final_active.append(r)
+        elif key in prev_active_keys and any(err in str(r.get("status", "")).lower() for err in ["timeout", "resolution", "failed"]):
+            # Retain previously active server on temporary connection lag
+            r["status"] = "Active (Retained)"
+            final_active.append(r)
 
-    active_results = [r for r in results if r["is_authenticated"] and r["status"].lower() == "active"]
+    # Sort results: Active first, then lowest ping
+    results.sort(key=lambda x: (not (x["is_authenticated"] and "active" in x["status"].lower()), x["response_time_ms"]))
+    final_active.sort(key=lambda x: x["response_time_ms"])
 
     if as_json:
-        output_data = active_results if active_only else results
+        output_data = final_active if active_only else results
         print(json.dumps(output_data, indent=2))
         return
 
@@ -158,12 +179,13 @@ def run_pipeline(
     print("                    🎯 VERIFIED ACTIVE XTREAM SERVERS                    ")
     print("=" * 95)
 
-    if not active_results:
+    if not final_active:
         print("\n❌ No active/working servers found at this time.\n")
     else:
-        for idx, s in enumerate(active_results, 1):
+        for idx, s in enumerate(final_active, 1):
             m3u_url = f"{s['server']}/get.php?username={urllib.parse.quote(s['username'])}&password={urllib.parse.quote(s['password'])}&type=m3u_plus&output=ts"
-            print(f"\n[Server #{idx}] - Status: ✅ Active (Latency: {s['response_time_ms']}ms)")
+            ping_disp = f"{s['response_time_ms']}ms" if s['response_time_ms'] > 0 else "Cached"
+            print(f"\n[Server #{idx}] - Status: ✅ {s['status']} (Latency: {ping_disp})")
             print(f"  • Server URL:   {s['server']}")
             print(f"  • Username:     {s['username']}")
             print(f"  • Password:     {s['password']}")
@@ -172,7 +194,7 @@ def run_pipeline(
             print(f"  • M3U URL:      {m3u_url}")
 
     if not active_only:
-        inactive = [r for r in results if not (r["is_authenticated"] and r["status"].lower() == "active")]
+        inactive = [r for r in results if r not in final_active]
         if inactive:
             print("\n" + "-" * 95)
             print("                     ⚠️ INACTIVE / EXPIRED / OFFLINE                     ")
@@ -182,17 +204,17 @@ def run_pipeline(
                 print(f"  • {r['server']:<32} | User: {r['username']:<15} | Status: ❌ {reason}")
 
     print("\n" + "=" * 95)
-    print(f"Total Evaluated: {len(results)} | Verified Working: {len(active_results)}")
+    print(f"Total Evaluated: {len(results)} | Active & Preserved: {len(final_active)}")
     print("=" * 95 + "\n")
 
     # 5. Export / Update active_servers.txt
     if export_path:
         lines = [
-            f"# SkyM3U Verified Active Servers ({len(active_results)} active)",
+            f"# SkyM3U Verified Active Servers ({len(final_active)} active)",
             f"# Updated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
             ""
         ]
-        for s in active_results:
+        for s in final_active:
             m3u = f"{s['server']}/get.php?username={s['username']}&password={s['password']}&type=m3u_plus&output=ts"
             lines.append(f"Server: {s['server']}")
             lines.append(f"    ID: {s['username']}")
@@ -202,7 +224,7 @@ def run_pipeline(
             lines.append(f"   M3U: {m3u}")
             lines.append("-" * 50)
         export_path.write_text("\n".join(lines), encoding="utf-8")
-        print(f"[+] Updated active servers list in: '{export_path}'\n")
+        print(f"[+] Saved {len(final_active)} active server(s) to: '{export_path}'\n")
 
 def main():
     parser = argparse.ArgumentParser(
