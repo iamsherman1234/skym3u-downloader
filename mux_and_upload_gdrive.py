@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Samkok 1080p Netflix Muxer & Google Drive Auto-Uploader
-Sequentially processes 1 episode at a time:
-1. Resolves 1080p stream URL via st.111477.xyz API
-2. Downloads 1080p video & Khmer AAC audio sequentially (1 connection at a time)
-3. Remuxes losslessly into dual-audio 1080p MKV
-4. Uploads to Google Drive via rclone
-5. Cleans up temporary files to keep disk usage under 3 GB
+Processes episodes sequentially with rock-solid auto-resuming downloads:
+1. Resolves fresh 1080p stream URL via st.111477.xyz
+2. Downloads 1080p video with curl auto-resumption (-C -) and retries
+3. Downloads Khmer AAC audio from OK.ru
+4. Remuxes losslessly into dual-audio 1080p MKV
+5. Uploads to Google Drive via rclone
+6. Cleans up temporary files to keep disk usage minimal (< 3 GB)
 """
 
 import sys
@@ -49,7 +50,7 @@ def save_progress(state_file: Path, progress: Dict[str, Any]):
 
 def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
-    for attempt in range(3):
+    for attempt in range(5):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=15) as resp:
@@ -81,42 +82,25 @@ def resolve_okru_audio_stream(embed_url: str) -> Optional[str]:
         print(f"[-] OK.ru stream resolution failed: {e}", file=sys.stderr)
     return None
 
-def download_file(url: str, output_path: Path, label: str = "File") -> bool:
-    """Downloads a file sequentially with live progress and speed calculation."""
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        start_time = time.time()
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            total_size = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            block_size = 1024 * 1024  # 1 MB
-
-            with open(output_path, "wb") as f:
-                while True:
-                    chunk = resp.read(block_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    
-                    elapsed = time.time() - start_time
-                    speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                    
-                    if total_size > 0:
-                        pct = (downloaded / total_size) * 100
-                        mb = downloaded / (1024 * 1024)
-                        total_mb = total_size / (1024 * 1024)
-                        print(f"\r    [{label}] {mb:.1f}/{total_mb:.1f} MB ({pct:.1f}%) @ {speed:.2f} MB/s", end="", flush=True)
-                    else:
-                        mb = downloaded / (1024 * 1024)
-                        print(f"\r    [{label}] {mb:.1f} MB downloaded @ {speed:.2f} MB/s", end="", flush=True)
-            print()
-            return output_path.exists() and output_path.stat().st_size > 100000
-    except Exception as e:
-        print(f"\n[-] Download failed for {label}: {e}", file=sys.stderr)
-        if output_path.exists():
-            output_path.unlink()
-        return False
+def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000) -> bool:
+    """Downloads a file using curl with auto-resume, retries, and rate recovery."""
+    cmd = [
+        "curl",
+        "-C", "-",
+        "-L",
+        "--retry", "10",
+        "--retry-delay", "3",
+        "--retry-all-errors",
+        "--connect-timeout", "20",
+        "--speed-time", "30",
+        "--speed-limit", "1000",
+        "-A", USER_AGENT,
+        "--progress-bar",
+        "-o", str(output_path),
+        url
+    ]
+    proc = subprocess.run(cmd)
+    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
 def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
     cmd = [
@@ -197,7 +181,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
         print(f"    [+] 1080p Stream URL resolved.")
 
         print(f"    📥 Downloading 1080p video file (~2.4 GB)...")
-        if not download_file(video_stream_url, temp_raw_video, label=f"Video E{ep_num:02d}"):
+        if not download_file_resilient(video_stream_url, temp_raw_video, min_size=50000000):
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
@@ -211,7 +195,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
             continue
 
         print(f"    📥 Downloading audio stream (~35 MB)...")
-        if not download_file(audio_stream_url, temp_audio_mp4, label=f"Audio E{ep_num:02d}"):
+        if not download_file_resilient(audio_stream_url, temp_audio_mp4, min_size=1000000):
             print(f"[-] Audio stream download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
