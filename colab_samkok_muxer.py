@@ -21,7 +21,7 @@ from typing import List, Dict, Any, Optional
 
 SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
-A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"  # https://a.111477.xyz/
+A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
@@ -36,7 +36,6 @@ def load_khmer_catalog() -> List[Dict[str, Any]]:
                 return json.loads(p.read_text(encoding="utf-8"))
             except Exception:
                 pass
-    # Download directly if running standalone in Colab
     url = "https://raw.githubusercontent.com/iamsherman1234/skym3u-downloader/main/samkok_khmer_episodes.json"
     try:
         req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
@@ -80,24 +79,58 @@ def resolve_okru_audio_stream(embed_url: str) -> Optional[str]:
         print(f"[-] OK.ru stream resolution failed: {e}", file=sys.stderr)
     return None
 
-def download_resilient(url: str, output_path: Path, min_size: int = 1000000) -> bool:
-    cmd = [
-        "curl",
-        "-C", "-",
-        "-L",
-        "--retry", "10",
-        "--retry-delay", "3",
-        "--retry-all-errors",
-        "--connect-timeout", "20",
-        "--speed-time", "30",
-        "--speed-limit", "1000",
-        "-A", USER_AGENT,
-        "--progress-bar",
-        "-o", str(output_path),
-        url
-    ]
-    proc = subprocess.run(cmd)
-    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
+def download_chunked_robust(url: str, output_path: Path, label: str = "File", min_size: int = 1000000, max_retries: int = 10) -> bool:
+    """Robust chunked downloader with HTTP Range resumption and retry loop."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    block_size = 2 * 1024 * 1024  # 2 MB chunks
+
+    for attempt in range(max_retries):
+        downloaded = output_path.stat().st_size if output_path.exists() else 0
+        headers = {"User-Agent": USER_AGENT}
+        if downloaded > 0:
+            headers["Range"] = f"bytes={downloaded}-"
+
+        req = urllib.request.Request(url, headers=headers)
+        start_time = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                status = getattr(resp, 'status', 200)
+                content_len = int(resp.headers.get("Content-Length", 0))
+                
+                if status == 206:
+                    total_size = downloaded + content_len
+                    mode = "ab"
+                else:
+                    total_size = content_len
+                    downloaded = 0
+                    mode = "wb"
+
+                with open(output_path, mode) as f:
+                    while True:
+                        chunk = resp.read(block_size)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                        downloaded += len(chunk)
+
+                        elapsed = time.time() - start_time
+                        speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                        if total_size > 0:
+                            pct = (downloaded / total_size) * 100
+                            mb = downloaded / (1024 * 1024)
+                            total_mb = total_size / (1024 * 1024)
+                            print(f"\r    [{label}] {mb:.1f}/{total_mb:.1f} MB ({pct:.1f}%) @ {speed:.2f} MB/s", end="", flush=True)
+                        else:
+                            mb = downloaded / (1024 * 1024)
+                            print(f"\r    [{label}] {mb:.1f} MB downloaded @ {speed:.2f} MB/s", end="", flush=True)
+                print()
+                if output_path.exists() and output_path.stat().st_size >= min_size:
+                    return True
+        except Exception as e:
+            print(f"\n[-] Download hiccup for {label} (attempt {attempt+1}/{max_retries}): {e}")
+            time.sleep(3)
+
+    return output_path.exists() and output_path.stat().st_size >= min_size
 
 def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
     cmd = [
@@ -162,19 +195,19 @@ def run_colab_pipeline(start_ep: int, end_ep: int, output_dir: Path, temp_dir: P
         temp_khmer_aac = temp_dir / f"temp_khmer_e{ep_num:02d}.aac"
 
         # 1. 1080p Video
-        print(f"[1/4] 🔍 Resolving 1080p stream for Episode {ep_num:02d}...")
+        print(f"[1/3] 🔍 Resolving 1080p stream for Episode {ep_num:02d}...")
         v_url = resolve_1080p_stream_url(ep_num)
         if not v_url:
             print(f"[-] Could not resolve 1080p stream for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
         print(f"    📥 Downloading 1080p Netflix video (~2.4 GB)...")
-        if not download_resilient(v_url, temp_raw_video, min_size=50000000):
+        if not download_chunked_robust(v_url, temp_raw_video, label=f"Video E{ep_num:02d}", min_size=50000000):
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
         # 2. Khmer Audio
-        print(f"[2/4] 🎙️ Resolving Khmer audio for Episode {ep_num:02d}...")
+        print(f"[2/3] 🎙️ Resolving Khmer audio for Episode {ep_num:02d}...")
         embed_url = ep_data.get("embed_url") or ep_data.get("source_url")
         a_url = resolve_okru_audio_stream(embed_url)
         if not a_url:
@@ -183,7 +216,7 @@ def run_colab_pipeline(start_ep: int, end_ep: int, output_dir: Path, temp_dir: P
             continue
 
         print(f"    📥 Downloading audio stream (~35 MB)...")
-        if not download_resilient(a_url, temp_audio_mp4, min_size=1000000):
+        if not download_chunked_robust(a_url, temp_audio_mp4, label=f"Audio E{ep_num:02d}", min_size=1000000):
             print(f"[-] Audio download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
@@ -192,7 +225,7 @@ def run_colab_pipeline(start_ep: int, end_ep: int, output_dir: Path, temp_dir: P
         if temp_audio_mp4.exists(): temp_audio_mp4.unlink()
 
         # 3. Losslessly Remux Directly to Google Drive
-        print(f"[3/4] ⚡ Losslessly remuxing directly into Google Drive: {final_mkv.name}...")
+        print(f"[3/3] ⚡ Losslessly remuxing directly into Google Drive: {final_mkv.name}...")
         mux_ok = remux_dual_audio(temp_raw_video, temp_khmer_aac, final_mkv, ep_num)
 
         # Cleanup local scratch files
