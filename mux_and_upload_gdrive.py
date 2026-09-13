@@ -222,7 +222,7 @@ def main():
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
-    parser.add_argument("-r", "--remote", type=str, default="chumlayan95_google_drive_1773847968:Samkok1080p", help="Rclone remote destination")
+    parser.add_argument("-r", "--remote", type=str, default="chumlayan95_google_drive_1773847968:ThreeKingdoms_1080p_Khmer", help="Rclone remote destination")
     parser.add_argument("-w", "--work-dir", type=str, default="/root/samkok_1080p_work", help="Working directory")
 
     args = parser.parse_args()
