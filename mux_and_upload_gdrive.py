@@ -116,6 +116,7 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
+        "-ss", "1.364",
         "-i", str(audio_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
