@@ -7,6 +7,14 @@ A lightweight, automated Python tool to fetch Xtream server lists and M3U playli
 - **No Third-Party Dependencies**: Runs on standard Python 3 (`urllib`, `re`, `argparse`).
 - **Dynamic Configuration Extraction**: Automatically scrapes the latest backend worker endpoint and authentication tokens from the page.
 - **Multiple Download Modes**: Supports downloading Xtream server lists, BDIX M3U playlists, or both simultaneously.
+- **GitHub Actions Automation**: Automatically runs every day at 00:00 UTC to refresh and validate the active servers.
+
+## ⚙️ GitHub Actions Automation
+
+The repository includes a daily automated workflow ([`.github/workflows/daily_update.yml`](.github/workflows/daily_update.yml)):
+- **Schedule**: Runs automatically every day at `00:00 UTC`.
+- **Manual Trigger**: You can run it on-demand anytime from the **Actions** tab in GitHub by selecting **Daily SkyM3U Update & Test** -> **Run workflow**.
+- **Auto-Commit**: Automatically pushes the freshly verified `active_servers.txt`, `xtream_servers.txt`, and `dedicated_ip.m3u` back to the repository.
 
 ## 🚀 One-Command Workflow (Download + Test + Show Active Only)
 

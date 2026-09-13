@@ -1,0 +1,44 @@
+name: Daily SkyM3U Update & Test
+
+on:
+  schedule:
+    # Runs daily at 00:00 UTC (customizable)
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allows manual trigger from GitHub UI
+
+permissions:
+  contents: write
+
+jobs:
+  update-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 📥 Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 🚀 Download and Test Servers
+        run: |
+          python3 skym3u_downloader.py --type all
+          python3 run.py -e active_servers.txt
+
+      - name: 💾 Commit and Push Changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add active_servers.txt xtream_servers.txt dedicated_ip.m3u
+          
+          if git diff --staged --quiet; then
+            echo "No changes detected. Skipping commit."
+          else
+            git commit -m "Auto-update: Daily Xtream servers & active list [skip ci]"
+            git push
+          fi
