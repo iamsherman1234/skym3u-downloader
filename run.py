@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-All-in-One SkyM3U Pipeline
-Downloads, validates, accumulates, and outputs active Xtream servers across runs.
-Preserves existing working servers across runs without dropping them on transient timeouts.
+All-in-One SkyM3U Pipeline (Xtream Codes & Stalker MAC Portals)
+Downloads, validates, accumulates, and outputs active Xtream & Stalker servers across runs.
 """
 
 import sys
@@ -11,22 +10,28 @@ import argparse
 import datetime
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any
 
 from skym3u_downloader import fetch_live_credentials, DEFAULT_PAGE_URL, USER_AGENT
-from xtream_tester import parse_xtream_file, test_single_server, format_timestamp
+from xtream_tester import (
+    parse_iptv_file,
+    parse_iptv_content,
+    test_single_server,
+    is_valid_mac,
+    format_timestamp
+)
 import urllib.request
 import urllib.parse
 import re
 
 def fetch_xtream_content(page_url: str = DEFAULT_PAGE_URL, quiet: bool = False) -> str:
-    """Fetches the latest Xtream server list text directly without ads."""
+    """Fetches the latest server list text directly without ads."""
     if not quiet:
         print("[1/3] 🌐 Fetching latest configuration from SkyM3U...")
     worker, token = fetch_live_credentials(page_url)
     
     if not quiet:
-        print(f"[2/3] 📥 Fetching newest Xtream list from worker backend...")
+        print(f"[2/3] 📥 Fetching newest server list from worker backend...")
     
     params = urllib.parse.urlencode({
         "type": "xtream",
@@ -39,63 +44,49 @@ def fetch_xtream_content(page_url: str = DEFAULT_PAGE_URL, quiet: bool = False) 
     with urllib.request.urlopen(req, timeout=15) as resp:
         return resp.read().decode("utf-8", errors="ignore")
 
-def parse_servers_from_text(content: str) -> List[Dict[str, str]]:
-    """Extracts server entries from raw text."""
-    pattern = re.compile(
-        r"Server:\s*(?P<server>https?://[^\s\r\n]+)"
-        r"(?:[\s\r\n]+ID:\s*(?P<id>[^\r\n]+))?"
-        r"(?:[\s\r\n]+CODE:\s*(?P<code>[^\r\n]+))?",
-        re.IGNORECASE
-    )
-    servers = []
-    for match in pattern.finditer(content):
-        server = match.group("server").strip()
-        user_id = (match.group("id") or "").strip()
-        code = (match.group("code") or "").strip()
-        if server and user_id and code:
-            servers.append({
-                "server": server.rstrip("/"),
-                "username": user_id,
-                "password": code
-            })
-    return servers
-
-def merge_and_deduplicate(*server_lists: List[Dict[str, str]]) -> List[Dict[str, str]]:
-    """Combines multiple server lists and removes exact duplicates."""
+def merge_and_deduplicate(*server_lists: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Combines multiple server lists and removes duplicates."""
     seen = set()
     merged = []
     for s_list in server_lists:
         for item in s_list:
-            if not item.get("server") or not item.get("username") or not item.get("password"):
+            server = (item.get("server") or "").strip().rstrip("/")
+            uid = (item.get("mac") or item.get("username") or "").strip()
+            pwd = (item.get("password") or "").strip()
+            acc_type = item.get("type", "stalker" if is_valid_mac(uid) else "xtream")
+
+            if not server or not uid:
                 continue
-            key = (
-                item["server"].strip().rstrip("/").lower(),
-                item["username"].strip(),
-                item["password"].strip()
-            )
+
+            key = (acc_type, server.lower(), uid.upper() if acc_type == "stalker" else uid, pwd)
             if key not in seen:
                 seen.add(key)
                 merged.append({
-                    "server": item["server"].strip().rstrip("/"),
-                    "username": item["username"].strip(),
-                    "password": item["password"].strip()
+                    "type": acc_type,
+                    "server": server,
+                    "mac" if acc_type == "stalker" else "username": uid.upper() if acc_type == "stalker" else uid,
+                    "password": pwd
                 })
     return merged
 
-def update_raw_xtream_file(new_servers: List[Dict[str, str]], filepath: Path = Path("xtream_servers.txt")):
+def update_raw_history_file(servers: List[Dict[str, Any]], filepath: Path = Path("xtream_servers.txt")):
     """Appends newly discovered servers to xtream_servers.txt without duplicates."""
-    existing = parse_xtream_file(filepath) if filepath.exists() else []
-    combined = merge_and_deduplicate(existing, new_servers)
+    existing = parse_iptv_file(filepath) if filepath.exists() else []
+    combined = merge_and_deduplicate(existing, servers)
     
     lines = [
-        "# SkyM3U All Discovered Servers History",
+        "# SkyM3U Discovered Servers History (Xtream & Stalker)",
         f"# Updated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
         ""
     ]
     for s in combined:
-        lines.append(f"Server: {s['server']}")
-        lines.append(f"    ID: {s['username']}")
-        lines.append(f"  CODE: {s['password']}")
+        if s.get("type") == "stalker":
+            lines.append(f"Portal: {s['server']}")
+            lines.append(f"   MAC: {s.get('mac') or s.get('username')}")
+        else:
+            lines.append(f"Server: {s['server']}")
+            lines.append(f"    ID: {s.get('username')}")
+            lines.append(f"  CODE: {s.get('password', '')}")
         lines.append("")
     filepath.write_text("\n".join(lines), encoding="utf-8")
 
@@ -107,30 +98,34 @@ def run_pipeline(
     quiet: bool = False,
     accumulate: bool = True
 ):
-    """Executes download -> merge with existing history -> test -> present & save."""
+    """Executes download -> parse Xtream & Stalker -> test -> present & accumulate."""
     # 1. Fetch newly scraped servers
     try:
         raw_text = fetch_xtream_content(page_url, quiet=quiet)
-        newly_scraped = parse_servers_from_text(raw_text)
+        newly_scraped = parse_iptv_content(raw_text)
     except Exception as e:
-        print(f"[-] Warning: Could not fetch live SkyM3U page ({e}). Evaluating existing accumulated servers.", file=sys.stderr)
+        print(f"[-] Warning: Could not fetch live SkyM3U page ({e}). Evaluating existing servers.", file=sys.stderr)
         newly_scraped = []
 
-    # 2. Collect existing servers from active_servers.txt and xtream_servers.txt if accumulating
+    # 2. Collect existing servers if accumulating
     existing_active = []
     existing_history = []
     export_path = Path(export_file) if export_file else None
     
     if accumulate:
         if export_path and export_path.exists():
-            existing_active = parse_xtream_file(export_path)
+            existing_active = parse_iptv_file(export_path)
         history_path = Path("xtream_servers.txt")
         if history_path.exists():
-            existing_history = parse_xtream_file(history_path)
+            existing_history = parse_iptv_file(history_path)
 
     # Set of previously active server keys
     prev_active_keys = {
-        (s["server"].lower().rstrip("/"), s["username"].strip(), s["password"].strip())
+        (
+            s.get("type", "xtream"),
+            s["server"].lower().rstrip("/"),
+            (s.get("mac") or s.get("username", "")).strip().upper()
+        )
         for s in existing_active
     }
 
@@ -142,32 +137,37 @@ def run_pipeline(
         sys.exit(1)
 
     # Save to history file
-    update_raw_xtream_file(all_targets, Path("xtream_servers.txt"))
+    update_raw_history_file(all_targets, Path("xtream_servers.txt"))
 
     if not quiet:
-        print(f"[3/3] ⚡ Validating {len(all_targets)} total server(s) ({len(newly_scraped)} new, {len(all_targets) - len(newly_scraped)} accumulated)...")
+        xtream_count = sum(1 for s in all_targets if s.get("type") == "xtream")
+        stalker_count = sum(1 for s in all_targets if s.get("type") == "stalker")
+        print(f"[3/3] ⚡ Validating {len(all_targets)} total server(s) [{xtream_count} Xtream, {stalker_count} Stalker]...")
 
-    # 4. Test all servers concurrently with 10s timeout
+    # 4. Test all servers concurrently
     results = []
-    with ThreadPoolExecutor(max_workers=8) as executor:
-        future_to_acc = {executor.submit(test_single_server, acc, 10): acc for acc in all_targets}
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        future_to_acc = {executor.submit(test_single_server, acc, 8): acc for acc in all_targets}
         for future in as_completed(future_to_acc):
             results.append(future.result())
 
-    # Build active list: Keep verified active servers, and retain previously active servers if only transient network timeout occurred
+    # Build active list: Keep verified active servers & preserve previously active servers on transient lag
     final_active = []
     for r in results:
-        key = (r["server"].lower().rstrip("/"), r["username"].strip(), r["password"].strip())
-        if r["is_authenticated"] and r["status"].lower() == "active":
+        key = (
+            r.get("type", "xtream"),
+            r["server"].lower().rstrip("/"),
+            (r.get("mac") or r.get("username", "")).strip().upper()
+        )
+        if r["is_authenticated"] and "active" in r["status"].lower():
             final_active.append(r)
         elif key in prev_active_keys and any(err in str(r.get("status", "")).lower() for err in ["timeout", "resolution", "failed"]):
-            # Retain previously active server on temporary connection lag
             r["status"] = "Active (Retained)"
             final_active.append(r)
 
-    # Sort results: Active first, then lowest ping
+    # Sort results
     results.sort(key=lambda x: (not (x["is_authenticated"] and "active" in x["status"].lower()), x["response_time_ms"]))
-    final_active.sort(key=lambda x: x["response_time_ms"])
+    final_active.sort(key=lambda x: (x.get("type") != "xtream", x["response_time_ms"]))
 
     if as_json:
         output_data = final_active if active_only else results
@@ -176,22 +176,37 @@ def run_pipeline(
 
     # Clean display
     print("\n" + "=" * 95)
-    print("                    🎯 VERIFIED ACTIVE XTREAM SERVERS                    ")
+    print("                 🎯 VERIFIED ACTIVE SERVERS (XTREAM & STALKER)                 ")
     print("=" * 95)
+
+    active_xtream = [s for s in final_active if s.get("type") == "xtream"]
+    active_stalker = [s for s in final_active if s.get("type") == "stalker"]
 
     if not final_active:
         print("\n❌ No active/working servers found at this time.\n")
     else:
-        for idx, s in enumerate(final_active, 1):
-            m3u_url = f"{s['server']}/get.php?username={urllib.parse.quote(s['username'])}&password={urllib.parse.quote(s['password'])}&type=m3u_plus&output=ts"
-            ping_disp = f"{s['response_time_ms']}ms" if s['response_time_ms'] > 0 else "Cached"
-            print(f"\n[Server #{idx}] - Status: ✅ {s['status']} (Latency: {ping_disp})")
-            print(f"  • Server URL:   {s['server']}")
-            print(f"  • Username:     {s['username']}")
-            print(f"  • Password:     {s['password']}")
-            print(f"  • Expiration:   {s['exp_date']}")
-            print(f"  • Connections:  {s['connections']} / {s['max_connections']} max")
-            print(f"  • M3U URL:      {m3u_url}")
+        if active_xtream:
+            print("\n📺 --- [ XTREAM CODES ACCOUNTS ] ---")
+            for idx, s in enumerate(active_xtream, 1):
+                m3u_url = f"{s['server']}/get.php?username={urllib.parse.quote(s['username'])}&password={urllib.parse.quote(s.get('password',''))}&type=m3u_plus&output=ts"
+                ping_disp = f"{s['response_time_ms']}ms" if s['response_time_ms'] > 0 else "Cached"
+                print(f"\n[Xtream #{idx}] - Status: ✅ {s['status']} (Latency: {ping_disp})")
+                print(f"  • Server URL:   {s['server']}")
+                print(f"  • Username:     {s['username']}")
+                print(f"  • Password:     {s.get('password','')}")
+                print(f"  • Expiration:   {s.get('exp_date', 'N/A')}")
+                print(f"  • Connections:  {s.get('connections','N/A')} / {s.get('max_connections','1')} max")
+                print(f"  • M3U URL:      {m3u_url}")
+
+        if active_stalker:
+            print("\n📡 --- [ STALKER / MAG PORTALS ] ---")
+            for idx, s in enumerate(active_stalker, 1):
+                ping_disp = f"{s['response_time_ms']}ms" if s['response_time_ms'] > 0 else "Cached"
+                mac_addr = s.get("mac") or s.get("username", "")
+                print(f"\n[Stalker #{idx}] - Status: ✅ {s['status']} (Latency: {ping_disp})")
+                print(f"  • Portal URL:   {s['server']}")
+                print(f"  • MAC Address:  {mac_addr}")
+                print(f"  • Expiration:   {s.get('exp_date', 'N/A')}")
 
     if not active_only:
         inactive = [r for r in results if r not in final_active]
@@ -200,35 +215,51 @@ def run_pipeline(
             print("                     ⚠️ INACTIVE / EXPIRED / OFFLINE                     ")
             print("-" * 95)
             for r in inactive:
+                acc_type = r.get("type", "xtream").upper()
+                identifier = r.get("mac") or r.get("username", "")
                 reason = r['status']
-                print(f"  • {r['server']:<32} | User: {r['username']:<15} | Status: ❌ {reason}")
+                print(f"  • [{acc_type:<7}] {r['server']:<32} | {identifier:<17} | Status: ❌ {reason}")
 
     print("\n" + "=" * 95)
-    print(f"Total Evaluated: {len(results)} | Active & Preserved: {len(final_active)}")
+    print(f"Total Evaluated: {len(results)} | Active & Preserved: {len(final_active)} ({len(active_xtream)} Xtream, {len(active_stalker)} Stalker)")
     print("=" * 95 + "\n")
 
     # 5. Export / Update active_servers.txt
     if export_path:
         lines = [
-            f"# SkyM3U Verified Active Servers ({len(final_active)} active)",
+            f"# SkyM3U Verified Active Servers ({len(active_xtream)} Xtream, {len(active_stalker)} Stalker)",
             f"# Updated: {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}",
             ""
         ]
-        for s in final_active:
-            m3u = f"{s['server']}/get.php?username={s['username']}&password={s['password']}&type=m3u_plus&output=ts"
-            lines.append(f"Server: {s['server']}")
-            lines.append(f"    ID: {s['username']}")
-            lines.append(f"  CODE: {s['password']}")
-            lines.append(f"   EXP: {s['exp_date']}")
-            lines.append(f"  CONN: {s['connections']}/{s['max_connections']}")
-            lines.append(f"   M3U: {m3u}")
-            lines.append("-" * 50)
+        if active_xtream:
+            lines.append("### XTREAM SERVERS ###")
+            for s in active_xtream:
+                m3u = f"{s['server']}/get.php?username={s['username']}&password={s.get('password','')}&type=m3u_plus&output=ts"
+                lines.append(f"Server: {s['server']}")
+                lines.append(f"    ID: {s['username']}")
+                lines.append(f"  CODE: {s.get('password','')}")
+                lines.append(f"   EXP: {s.get('exp_date', 'N/A')}")
+                lines.append(f"  CONN: {s.get('connections','N/A')}/{s.get('max_connections','1')}")
+                lines.append(f"   M3U: {m3u}")
+                lines.append("-" * 50)
+            lines.append("")
+
+        if active_stalker:
+            lines.append("### STALKER PORTALS ###")
+            for s in active_stalker:
+                mac_addr = s.get("mac") or s.get("username", "")
+                lines.append(f"Portal: {s['server']}")
+                lines.append(f"   MAC: {mac_addr}")
+                lines.append(f"   EXP: {s.get('exp_date', 'N/A')}")
+                lines.append("-" * 50)
+            lines.append("")
+
         export_path.write_text("\n".join(lines), encoding="utf-8")
         print(f"[+] Saved {len(final_active)} active server(s) to: '{export_path}'\n")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="All-in-one tool to download, test, accumulate, and show verified active Xtream servers."
+        description="All-in-one tool to download, test, accumulate, and show active Xtream & Stalker servers."
     )
     parser.add_argument(
         "-a", "--all",
