@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 Samkok 1080p Netflix Muxer & Google Drive Auto-Uploader
-Sequentially downloads 1080p Netflix video + Khmer audio, losslessly remuxes into dual-audio MKV,
-uploads to Google Drive via rclone, and cleans up local temporary files.
+Uses st.111477.xyz API to resolve 1080p streams + dynamic OK.ru Khmer audio extraction.
+Losslessly remuxes into dual-audio 1080p MKV and uploads to Google Drive via rclone.
 """
 
 import sys
@@ -10,13 +10,16 @@ import os
 import re
 import json
 import time
+import base64
 import argparse
 import subprocess
 import urllib.request
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
-NETFLIX_BASE_URL = "https://a.111477.xyz/asiandrama/Three.Kingdoms.S01.2010.1080p.NF.WEB-DL.AAC2.0.H264-HHWEB/"
+SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
+STREMIO_BASE = "https://st.111477.xyz"
+A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"  # https://a.111477.xyz/
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
@@ -31,7 +34,7 @@ def load_khmer_catalog() -> List[Dict[str, Any]]:
     return []
 
 def load_progress(state_file: Path) -> Dict[str, Any]:
-    """Loads the progress state to allow resumption."""
+    """Loads progress state to support seamless resumption."""
     if state_file.exists():
         try:
             return json.loads(state_file.read_text(encoding="utf-8"))
@@ -43,63 +46,83 @@ def save_progress(state_file: Path, progress: Dict[str, Any]):
     """Saves progress state."""
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
-def download_file(url: str, output_path: Path, headers: Dict[str, str] = None) -> bool:
-    """Downloads a file with progress indication."""
-    req_headers = {"User-Agent": USER_AGENT}
-    if headers:
-        req_headers.update(headers)
-    req = urllib.request.Request(url, headers=req_headers)
-    
+def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
+    """Resolves direct 1080p stream URL via st.111477.xyz worker proxy."""
+    url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            total_size = int(resp.headers.get("Content-Length", 0))
-            downloaded = 0
-            block_size = 1024 * 1024 # 1MB
-
-            with open(output_path, "wb") as f:
-                while True:
-                    chunk = resp.read(block_size)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total_size > 0:
-                        pct = (downloaded / total_size) * 100
-                        mb = downloaded / (1024 * 1024)
-                        total_mb = total_size / (1024 * 1024)
-                        print(f"\r    Downloading: {mb:.1f}/{total_mb:.1f} MB ({pct:.1f}%)", end="", flush=True)
-            print()
-            return True
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            streams = data.get("streams", [])
+            if streams:
+                return streams[0].get("url")
     except Exception as e:
-        print(f"\n[-] Download failed: {e}", file=sys.stderr)
-        if output_path.exists():
-            output_path.unlink()
-        return False
+        print(f"[-] Failed to resolve 1080p stream from st.111477.xyz for E{ep_num:02d}: {e}", file=sys.stderr)
+    return None
 
-def remux_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
-    """Losslessly muxes the 1080p video stream and Khmer audio into dual-audio MKV."""
+def resolve_okru_audio_stream(embed_url: str) -> Optional[str]:
+    """Extracts direct CDN stream URL from OK.ru embed page."""
+    try:
+        req = urllib.request.Request(embed_url, headers={"User-Agent": USER_AGENT})
+        html = urllib.request.urlopen(req, timeout=12).read().decode("utf-8", errors="ignore")
+        m = re.search(r'data-options=["\']([^"\']+)["\']', html)
+        if not m:
+            return None
+        raw_opt = m.group(1).replace("&quot;", '"')
+        data = json.loads(raw_opt)
+        videos = data.get("flashvars", {}).get("metadata", {}).get("videos", [])
+        
+        # Audio is identical AAC across all video quality tiers; pick lowest to minimize bandwidth
+        for v in videos:
+            if v.get("name") in ["lowest", "mobile", "low"]:
+                return v.get("url")
+        if videos:
+            return videos[0].get("url")
+    except Exception as e:
+        print(f"[-] OK.ru stream resolution failed: {e}", file=sys.stderr)
+    return None
+
+def extract_khmer_audio(audio_stream_url: str, output_file: Path) -> bool:
+    """Extracts AAC audio track directly via ffmpeg."""
     cmd = [
         "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-i", str(audio_path),
+        "-user_agent", USER_AGENT,
+        "-i", audio_stream_url,
+        "-vn", "-acodec", "copy",
+        str(output_file)
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    return proc.returncode == 0 and output_file.exists() and output_file.stat().st_size > 500000
+
+def remux_dual_audio(video_stream_url: str, audio_file: Path, output_mkv: Path, ep_num: int) -> bool:
+    """Muxes 1080p video with Khmer audio (Track 1) and original Mandarin (Track 2)."""
+    cmd = [
+        "ffmpeg", "-y",
+        "-user_agent", USER_AGENT,
+        "-i", video_stream_url,
+        "-i", str(audio_file),
         "-map", "0:v:0",
         "-map", "1:a:0",
         "-map", "0:a:0?",
-        "-c", "copy",
+        "-c:v", "copy",
+        "-c:a", "copy",
         "-metadata:s:a:0", "language=khm",
-        "-metadata:s:a:0", "title=Khmer Dubbed (Hang Meas / CTN)",
+        "-metadata:s:a:0", "title=Khmer Dubbed (Hang Meas)",
         "-metadata:s:a:1", "language=zho",
         "-metadata:s:a:1", "title=Original Mandarin",
-        "-metadata", f"title=Three Kingdoms (2010) - Episode {ep_num:02d} [1080p Dual Audio]",
+        "-disposition:a:0", "default",
+        "-disposition:a:1", "none",
+        "-metadata", f"title=Three Kingdoms (2010) - Episode {ep_num:02d} [1080p Khmer Dubbed]",
+        "-t", "2605",
         str(output_mkv)
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
-    return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 1000000
+    return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 10000000
 
 def upload_to_rclone(local_file: Path, remote_dest: str) -> bool:
-    """Uploads the file to Google Drive using rclone."""
+    """Uploads file to Google Drive using rclone."""
     print(f"[*] Uploading '{local_file.name}' to {remote_dest}...")
-    cmd = ["rclone", "copy", str(local_file), remote_dest, "--stats", "5s", "--progress"]
+    cmd = ["rclone", "copyto", str(local_file), f"{remote_dest.rstrip('/')}/{local_file.name}", "--stats", "5s", "--progress"]
     proc = subprocess.run(cmd)
     return proc.returncode == 0
 
@@ -107,11 +130,9 @@ def process_pipeline(
     start_ep: int,
     end_ep: int,
     remote_dest: Optional[str],
-    work_dir: Path,
-    raw_video_dir: Optional[Path] = None,
-    cookie_str: Optional[str] = None
+    work_dir: Path
 ):
-    """Sequentially processes each episode."""
+    """Processes all requested episodes in sequence."""
     catalog = load_khmer_catalog()
     if not catalog:
         return
@@ -121,7 +142,11 @@ def process_pipeline(
     progress = load_progress(state_file)
 
     print(f"\n{'='*80}")
-    print(f"🎬 Starting Samkok 1080p Muxing & GDrive Pipeline (Episodes {start_ep} to {end_ep})")
+    print(f"🎬 Starting Samkok 1080p Automated Pipeline (Episodes {start_ep} to {end_ep})")
+    print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
+    print(f"🎙️  Khmer Audio Source: movie-khmer.com (AAC Stereo)")
+    if remote_dest:
+        print(f"☁️  Google Drive Remote: {remote_dest}")
     print(f"{'='*80}\n")
 
     for ep_num in range(start_ep, end_ep + 1):
@@ -129,100 +154,83 @@ def process_pipeline(
             print(f"[✓] Episode {ep_num:02d} already completed. Skipping.")
             continue
 
-        print(f"\n--- [ Processing Episode {ep_num:02d} of {end_ep:02d} ] ---")
+        print(f"\n--- [ Processing Episode {ep_num:02d} / {end_ep:02d} ] ---")
         ep_data = catalog[ep_num - 1]
         
-        temp_video = work_dir / f"temp_video_e{ep_num:02d}.mkv"
-        temp_audio = work_dir / f"temp_audio_e{ep_num:02d}.mp4"
+        temp_audio = work_dir / f"temp_khmer_audio_e{ep_num:02d}.aac"
         final_mkv = work_dir / f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
 
-        # 1. Obtain 1080p Netflix Video
-        has_video = False
-        if raw_video_dir:
-            # Check local file in raw_video_dir
-            candidates = list(raw_video_dir.glob(f"*E{ep_num:02d}*.mkv")) + list(raw_video_dir.glob(f"*E{ep_num:02d}*.mp4"))
-            if candidates:
-                temp_video = candidates[0]
-                print(f"[1/4] 📁 Using local 1080p video file: {temp_video.name}")
-                has_video = True
+        # 1. Resolve 1080p Stream URL
+        print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
+        video_stream_url = resolve_1080p_stream_url(ep_num)
+        if not video_stream_url:
+            print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+            continue
+        print(f"    [+] 1080p Stream URL resolved.")
 
-        if not has_video:
-            nf_url = f"{NETFLIX_BASE_URL}Three.Kingdoms.S01E{ep_num:02d}.2010.1080p.NF.WEB-DL.AAC2.0.H264-HHWEB.mkv"
-            headers = {"Referer": "https://a.111477.xyz/"}
-            if cookie_str:
-                headers["Cookie"] = cookie_str
-            print(f"[1/4] 📥 Downloading 1080p video from {nf_url}...")
-            has_video = download_file(nf_url, temp_video, headers)
-
-        if not has_video:
-            print(f"[-] Could not obtain 1080p video for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+        # 2. Resolve and Extract Khmer Audio
+        print(f"[2/4] 🎙️ Extracting Khmer AAC audio from OK.ru...")
+        embed_url = ep_data.get("embed_url") or ep_data.get("source_url")
+        audio_stream_url = resolve_okru_audio_stream(embed_url)
+        if not audio_stream_url:
+            print(f"[-] Could not resolve audio stream for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
-        # 2. Download Khmer Audio stream
-        khmer_audio_url = ep_data.get("direct_mp4") or ep_data.get("file")
-        print(f"[2/4] 📥 Downloading Khmer Audio track (Episode {ep_num:02d})...")
-        has_audio = download_file(khmer_audio_url, temp_audio)
-
-        if not has_audio:
-            print(f"[-] Could not download Khmer audio for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+        audio_ok = extract_khmer_audio(audio_stream_url, temp_audio)
+        if not audio_ok:
+            print(f"[-] Failed to extract Khmer audio for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
+        print(f"    [+] Audio extracted: {temp_audio.stat().st_size / (1024*1024):.2f} MB")
 
-        # 3. Losslessly Mux
-        print(f"[3/4] ⚡ Muxing lossless 1080p dual-audio MKV...")
-        mux_success = remux_streams(temp_video, temp_audio, final_mkv, ep_num)
-
-        if not mux_success:
-            print(f"[-] Muxing failed for Episode {ep_num:02d}.", file=sys.stderr)
+        # 3. Losslessly Remux 1080p Video + Khmer Audio
+        print(f"[3/4] ⚡ Remuxing 1080p Dual-Audio MKV (Stream Copy)...")
+        mux_ok = remux_dual_audio(video_stream_url, temp_audio, final_mkv, ep_num)
+        if not mux_ok:
+            print(f"[-] Remuxing failed for Episode {ep_num:02d}.", file=sys.stderr)
             continue
 
         size_mb = final_mkv.stat().st_size / (1024 * 1024)
-        print(f"[+] ✅ Successfully created: {final_mkv.name} ({size_mb:.1f} MB)")
+        print(f"[+] ✅ Created: {final_mkv.name} ({size_mb:.1f} MB)")
 
-        # 4. Upload to Google Drive (if remote destination provided)
+        # 4. Upload to Google Drive (if remote configured)
         if remote_dest:
-            print(f"[4/4] ☁️ Uploading to Google Drive ({remote_dest})...")
+            print(f"[4/4] ☁️ Uploading to Google Drive...")
             uploaded = upload_to_rclone(final_mkv, remote_dest)
             if uploaded:
-                print(f"[+] 🚀 Uploaded to Google Drive successfully!")
-                # Delete local temporary files
+                print(f"[+] 🚀 Uploaded Episode {ep_num:02d} successfully!")
                 if final_mkv.exists(): final_mkv.unlink()
                 if temp_audio.exists(): temp_audio.unlink()
-                if not raw_video_dir and temp_video.exists(): temp_video.unlink()
                 print(f"[+] 🧹 Cleaned up local temporary files.")
             else:
-                print(f"[-] Upload to Google Drive failed.", file=sys.stderr)
+                print(f"[-] ⚠️ Upload failed. File retained locally at {final_mkv}", file=sys.stderr)
+        else:
+            if temp_audio.exists(): temp_audio.unlink()
+            print(f"[+] 💾 Saved locally at: {final_mkv}")
 
-        # Mark as completed
+        # Mark episode completed
         progress["completed"].append(ep_num)
         save_progress(state_file, progress)
 
-        # Rate limiting delay to respect 1-connection/IP rule
-        print(f"[*] Sleeping 3 seconds before next episode to respect single-connection rule...")
+        print(f"[*] Cooldown 3s before next episode...")
         time.sleep(3)
 
-    print(f"\n🎉 All requested episodes finished!")
+    print(f"\n🎉 All episodes successfully processed!")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Mux 1080p Netflix Three Kingdoms with Khmer Dub and upload to Google Drive via rclone."
+        description="Automated 1080p Netflix Three Kingdoms Khmer Dub Remuxer & GDrive Uploader."
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
-    parser.add_argument("-r", "--remote", type=str, default="chumlayan95_google_drive_1773847968:ThreeKingdoms1080p", help="Rclone remote destination (e.g. 'my_gdrive:Samkok1080p')")
-    parser.add_argument("-d", "--raw-video-dir", type=str, help="Directory containing pre-downloaded 1080p MKVs from a.111477.xyz")
-    parser.add_argument("-c", "--cookie", type=str, help="Cloudflare / session cookie string for direct a.111477.xyz downloads")
-    parser.add_argument("-w", "--work-dir", type=str, default="./temp_mux_work", help="Working directory for temporary files")
+    parser.add_argument("-r", "--remote", type=str, default="chumlayan95_google_drive_1773847968:Samkok1080p", help="Rclone remote destination")
+    parser.add_argument("-w", "--work-dir", type=str, default="/root/samkok_1080p_work", help="Working directory")
 
     args = parser.parse_args()
-
-    raw_dir = Path(args.raw_video_dir) if args.raw_video_dir else None
     process_pipeline(
         start_ep=args.start,
         end_ep=args.end,
-        remote_dest=args.remote if args.remote != "" else None,
-        work_dir=Path(args.work_dir),
-        raw_video_dir=raw_dir,
-        cookie_str=args.cookie
+        remote_dest=args.remote if args.remote != "none" else None,
+        work_dir=Path(args.work_dir)
     )
 
 if __name__ == "__main__":
