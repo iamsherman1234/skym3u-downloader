@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
-Samkok 1080p Netflix Khmer Dub Muxer with PixelDrain & GDrive Uploader for Google Colab
-Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Netflix 1080p WEB-DL (st.111477.xyz)
+Samkok 1080p Torrent & Netflix Khmer Dub Muxer with PixelDrain & GDrive Uploader for Google Colab
+Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Jiang Hu 1080p HD Torrent / Netflix 1080p WEB-DL
 Seamlessly processes episodes in Google Colab:
-- Resolves 1080p Netflix stream from st.111477.xyz or uses manual URL override
+- Downloads individual 1080p episode from Torrent (Jiang Hu 1080p HD) via aria2c (Zero Cloudflare rate limits!)
 - Extracts Khmer AAC audio from TheKomsan (Rumble CDN)
-- Applies physical silence delay (+1.0s) for player-compatible lip sync
-- Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles
+- Applies audio sync delay and ad cutting
+- Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles / Original Audio
 - Auto-uploads directly to PixelDrain and/or mounted Google Drive
+- Cleans up temporary files after each episode (< 3 GB disk usage)
 """
 
 import sys
@@ -32,17 +33,42 @@ SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-DEFAULT_AUDIO_DELAY = 1.0  # +1.0 second delay to match Netflix 1080p intro
 DEFAULT_PIXELDRAIN_KEY = "cafccc0b-66db-4f1d-a5bb-de45da49f9d5"
+
+DEFAULT_MAGNET_LINK = (
+    "magnet:?xt=urn:btih:E02118B52E1818B89C4EF6CEAC62BC68FF55241E"
+    "&dn=%5B1080p%5D%20Three%20Kingdoms%202010%20(HC%20English%20Subtitles)"
+    "&tr=UDP://TRACKER.OPENTRACKR.ORG:1337/ANNOUNCE"
+    "&tr=udp://tracker.openbittorrent.com:6969/announce"
+    "&tr=udp://open.stealth.si:80/announce"
+    "&tr=udp://www.torrent.eu.org:451/announce"
+    "&tr=udp://tracker.torrent.eu.org:451/announce"
+    "&tr=udp://opentracker.i2p.rocks:6969/announce"
+    "&tr=https://opentracker.i2p.rocks:443/announce"
+    "&tr=udp://ipv4.tracker.harry.lu:80/announce"
+    "&tr=udp://exodus.desync.com:6969/announce"
+    "&tr=udp://tracker.tiny-vps.com:6969/announce"
+    "&tr=udp://opentor.org:2710/announce"
+    "&tr=udp://tracker.dler.org:6969/announce"
+    "&tr=udp://explodie.org:6969/announce"
+    "&tr=udp://tracker.opentrackr.org:1337/announce"
+    "&tr=http://tracker.openbittorrent.com:80/announce"
+    "&tr=udp://opentracker.i2p.rocks:6969/announce"
+    "&tr=udp://tracker.internetwarriors.net:1337/announce"
+    "&tr=udp://tracker.leechers-paradise.org:6969/announce"
+    "&tr=udp://coppersurfer.tk:6969/announce"
+    "&tr=udp://tracker.zer0day.to:1337/announce"
+)
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
     candidates = [
         Path("thekomsan_samkok_episodes.json"),
         Path("/content/skym3u-downloader/thekomsan_samkok_episodes.json"),
-        Path("/root/skym3u-downloader/thekomsan_samkok_episodes.json")
+        Path("/root/skym3u-downloader/thekomsan_samkok_episodes.json"),
+        Path(__file__).parent / "thekomsan_samkok_episodes.json" if "__file__" in globals() else None
     ]
     for p in candidates:
-        if p.exists():
+        if p and p.exists():
             try:
                 return json.loads(p.read_text(encoding="utf-8"))
             except Exception:
@@ -56,259 +82,169 @@ def load_khmer_catalog() -> List[Dict[str, Any]]:
         print(f"[-] Error loading Khmer catalog: {e}", file=sys.stderr)
         return []
 
-def load_netflix_streams_catalog() -> Dict[str, str]:
+def find_torrent_source(custom_torrent: Optional[str] = None) -> str:
+    if custom_torrent:
+        if Path(custom_torrent).exists():
+            return str(Path(custom_torrent).resolve())
+        return custom_torrent
+
     candidates = [
-        Path("netflix_samkok_1080p_streams.json"),
-        Path("/content/skym3u-downloader/netflix_samkok_1080p_streams.json"),
-        Path("/root/skym3u-downloader/netflix_samkok_1080p_streams.json")
+        Path("samkok_1080p.torrent"),
+        Path("e02118b52e1818b89c4ef6ceac62bc68ff55241e.torrent"),
+        Path("/content/skym3u-downloader/samkok_1080p.torrent"),
+        Path("/content/skym3u-downloader/e02118b52e1818b89c4ef6ceac62bc68ff55241e.torrent"),
+        Path("/root/skym3u-downloader/samkok_1080p.torrent"),
+        Path("/root/skym3u-downloader/e02118b52e1818b89c4ef6ceac62bc68ff55241e.torrent"),
     ]
     for p in candidates:
-        if p.exists():
-            try:
-                return json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-    url = "https://raw.githubusercontent.com/iamsherman1234/skym3u-downloader/main/netflix_samkok_1080p_streams.json"
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except Exception:
-        pass
-    return {}
+        if p.exists() and p.stat().st_size > 1000:
+            return str(p.resolve())
 
-def get_default_proxy(explicit_proxy: Optional[str] = None) -> Optional[str]:
-    if explicit_proxy and explicit_proxy.lower() != "none":
-        return explicit_proxy
-    return None
+    return DEFAULT_MAGNET_LINK
 
-def resolve_1080p_stream_url(ep_num: int, proxy: Optional[str] = None) -> Optional[str]:
-    # Check pre-cached catalog first to avoid HTTP 429 rate limits
-    catalog = load_netflix_streams_catalog()
-    if str(ep_num) in catalog and catalog[str(ep_num)]:
-        return catalog[str(ep_num)]
+def download_torrent_episode(ep_num: int, work_dir: Path, torrent_source: str) -> Optional[Path]:
+    """
+    Downloads a single 1080p episode from the Jiang Hu Three Kingdoms torrent using aria2c.
+    Episode index mapping: Ep 1 -> 3, Ep 2 -> 5, ..., Ep N -> (N * 2) + 1.
+    """
+    work_dir.mkdir(parents=True, exist_ok=True)
+    file_index = (ep_num * 2) + 1
+    expected_rel_name = f"[Jiang Hu] Three Kingdoms 2010 HD {ep_num:02d}.mp4"
+    expected_full_path = work_dir / "[Jiang Hu] Three Kingdoms 2010 HD" / expected_rel_name
 
-    active_proxy = get_default_proxy(proxy)
-    url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
-    backoff = 3
-    for attempt in range(5):
-        try:
-            if HAS_CURL_CFFI:
-                r = cffi_requests.get(url, impersonate="chrome", timeout=15, headers={"Referer": "https://st.111477.xyz/"}, proxy=active_proxy)
-                if r.status_code == 200:
-                    data = r.json()
-                    streams = data.get("streams", [])
-                    if streams:
-                        return streams[0].get("url")
-                elif r.status_code == 429:
-                    raise urllib.error.HTTPError(url, 429, "Too Many Requests", r.headers, None)
-            else:
-                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": "https://st.111477.xyz/"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                    streams = data.get("streams", [])
-                    if streams:
-                        return streams[0].get("url")
-        except urllib.error.HTTPError as e:
-            if e.code == 429:
-                print(f"[-] Rate limited (429) resolving stream for E{ep_num:02d}. Backing off {backoff}s...", file=sys.stderr)
-                time.sleep(backoff)
-                backoff = min(backoff + 5, 20)
-            else:
-                print(f"[-] HTTP {e.code} resolving stream for E{ep_num:02d} (attempt {attempt+1}): {e}", file=sys.stderr)
-                time.sleep(3)
-        except Exception as e:
-            print(f"[-] Attempt {attempt+1} failed to resolve stream for E{ep_num:02d}: {e}", file=sys.stderr)
-            time.sleep(3)
-    return None
+    # If already downloaded and complete (~1.5 GB)
+    if expected_full_path.exists() and expected_full_path.stat().st_size > 500000000:
+        # Check if no .aria2 file exists for it
+        aria2_ctrl = work_dir / f"[Jiang Hu] Three Kingdoms 2010 HD.aria2"
+        if not aria2_ctrl.exists():
+            print(f"    [✓] Torrent video already downloaded: {expected_full_path.name}")
+            return expected_full_path
 
-def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0, proxy: Optional[str] = None) -> bool:
-    """Bounded Slice-Range Resumable Downloader for Cloudflare Workers & CDNs."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    active_proxy = get_default_proxy(proxy)
-    
-    # 1. Probe total file size with a 1-byte range request
-    total_size = 0
-    probe_headers = {
-        "User-Agent": USER_AGENT,
-        "Referer": "https://st.111477.xyz/",
-        "Range": "bytes=0-0"
-    }
-    for _ in range(5):
-        try:
-            if HAS_CURL_CFFI:
-                r = cffi_requests.get(url, headers=probe_headers, impersonate="chrome", timeout=15, proxy=active_proxy)
-                cr = r.headers.get("content-range") or r.headers.get("Content-Range")
-            else:
-                req = urllib.request.Request(url, headers=probe_headers)
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    cr = resp.headers.get("content-range") or resp.headers.get("Content-Range")
-            
-            if cr and "/" in cr:
-                total_size = int(cr.split("/")[-1])
-                break
-        except Exception:
-            time.sleep(1)
-            
-    if output_path.exists():
-        if total_size > 0 and output_path.stat().st_size >= total_size:
-            return True
-        if total_size == 0 and output_path.stat().st_size >= min_size:
-            return True
-
-    # 2. Slice-based chunk downloading (10 MB per request to keep worker execution within free limits)
-    SLICE_SIZE = 10 * 1024 * 1024
-    current_size = output_path.stat().st_size if output_path.exists() else 0
-    start_time = time.time()
-
-    while total_size == 0 or current_size < total_size:
-        start_byte = current_size
-        end_byte = min(start_byte + SLICE_SIZE - 1, total_size - 1) if total_size > 0 else start_byte + SLICE_SIZE - 1
-        
-        slice_downloaded = False
-        backoff = 5
-        for attempt in range(1, 12):
-            try:
-                headers = {
-                    "User-Agent": USER_AGENT,
-                    "Referer": "https://st.111477.xyz/",
-                    "Range": f"bytes={start_byte}-{end_byte}",
-                    "Accept": "*/*",
-                }
-                slice_start = time.time()
-                if HAS_CURL_CFFI:
-                    r = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=45, proxy=active_proxy)
-                    if r.status_code == 429:
-                        raise urllib.error.HTTPError(url, 429, "Too Many Requests", r.headers, None)
-                    if r.status_code not in (200, 206):
-                        raise Exception(f"HTTP {r.status_code}")
-                    content = r.content
-                else:
-                    req = urllib.request.Request(url, headers=headers)
-                    with urllib.request.urlopen(req, timeout=45) as resp:
-                        content = resp.read()
-
-                if not content:
-                    raise Exception("Empty slice received")
-
-                with open(output_path, "ab") as f:
-                    f.write(content)
-
-                current_size = output_path.stat().st_size
-
-                # Speed pacing
-                if max_speed_mb > 0:
-                    target_time = len(content) / (max_speed_mb * 1024 * 1024)
-                    slice_elapsed = time.time() - slice_start
-                    if slice_elapsed < target_time:
-                        time.sleep(target_time - slice_elapsed)
-
-                # Progress printing
-                elapsed = time.time() - start_time
-                speed = (current_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                mb_cur = current_size / (1024 * 1024)
-                if total_size > 0:
-                    pct = (current_size / total_size) * 100
-                    mb_tot = total_size / (1024 * 1024)
-                    print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
-                else:
-                    print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
-
-                slice_downloaded = True
-                break
-
-            except urllib.error.HTTPError as e:
-                if e.code == 429:
-                    print(f"\n    [!] HTTP 429 on slice {start_byte // (1024*1024)}MB. Backing off {backoff}s...", file=sys.stderr)
-                    time.sleep(backoff)
-                    backoff = min(backoff + 5, 30)
-                else:
-                    print(f"\n    [!] HTTP {e.code} on slice. Retrying in 4s...", file=sys.stderr)
-                    time.sleep(4)
-            except Exception as e:
-                print(f"\n    [!] Slice error: {e}. Retrying in 4s...", file=sys.stderr)
-                time.sleep(4)
-
-        if not slice_downloaded:
-            print(f"\n[-] Failed to download slice after retries.", file=sys.stderr)
-            break
-
-    print()
-    return output_path.exists() and output_path.stat().st_size >= min_size
-
-def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_size: int = 1000000, max_speed_mb: float = 10.0) -> bool:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists() and output_path.stat().st_size == 0:
-        output_path.unlink()
-        
+    print(f"    🧲 Downloading Episode {ep_num:02d} via BitTorrent (Index: {file_index})...")
     cmd = [
         "aria2c",
-        "-x", str(connections),
-        "-s", str(connections),
-        "-k", "1M",
-        f"--max-download-limit={int(max_speed_mb)}M",
-        "-d", str(output_path.parent),
-        "-o", output_path.name,
-        "-U", USER_AGENT,
-        "--header=Referer: https://st.111477.xyz/",
-        "--check-certificate=false",
-        "--allow-overwrite=true",
-        "--auto-file-renaming=false",
+        f"--select-file={file_index}",
+        "--seed-time=0",
+        "--file-allocation=none",
+        "--bt-enable-lpd=true",
+        "--enable-dht=true",
+        "--dht-listen-port=6881",
+        "--enable-peer-exchange=true",
+        "--bt-max-peers=120",
+        "--max-overall-upload-limit=10K",
         "--summary-interval=5",
-        "--max-tries=10",
-        "--retry-wait=3",
-        url
+        "--console-log-level=warn",
+        f"--dir={work_dir}",
+        torrent_source
     ]
-    proc = subprocess.run(cmd)
-    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
-def download_file_curl(url: str, output_path: Path, min_size: int = 1000000, max_speed_mb: float = 10.0) -> bool:
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+        for line in proc.stdout:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            # Display progress lines cleanly
+            if "[" in line_str and "]" in line_str and ("MiB" in line_str or "GiB" in line_str or "ETA" in line_str):
+                print(f"\r    📥 [Torrent E{ep_num:02d}] {line_str}", end="", flush=True)
+            elif "Download complete" in line_str or "Seeds:" in line_str or "errorCode" in line_str:
+                print(f"\n    [aria2] {line_str}")
+
+        proc.wait()
+        print()
+
+        if expected_full_path.exists() and expected_full_path.stat().st_size > 500000000:
+            print(f"    [+] Successfully downloaded: {expected_full_path.name} ({expected_full_path.stat().st_size / (1024*1024):.1f} MB)")
+            return expected_full_path
+        else:
+            # Check if file was downloaded directly to work_dir without subfolder
+            alt_path = work_dir / expected_rel_name
+            if alt_path.exists() and alt_path.stat().st_size > 500000000:
+                return alt_path
+            print(f"    [-] Expected torrent output file not found or incomplete: {expected_full_path}", file=sys.stderr)
+            return None
+
+    except Exception as e:
+        print(f"    [-] aria2c execution error: {e}", file=sys.stderr)
+        return None
+
+def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Audio", max_speed_mb: float = 0.0) -> bool:
+    """Slice-range & streaming downloader for audio & CDN files."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists():
-        output_path.unlink()
+    if output_path.exists() and output_path.stat().st_size >= min_size:
+        return True
 
-    base_cmd = [
-        "curl",
-        "-L",
-        "--limit-rate", f"{int(max_speed_mb)}M",
-        "--retry", "5",
-        "--retry-delay", "3",
-        "--connect-timeout", "20",
-        "-A", USER_AGENT,
-        "-H", "Referer: https://st.111477.xyz/",
-        "--progress-bar",
-        "-o", str(output_path),
-        url
-    ]
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+    }
+    
+    start_time = time.time()
+    for attempt in range(1, 6):
+        try:
+            if HAS_CURL_CFFI:
+                r = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=60, stream=True)
+                if r.status_code not in (200, 206):
+                    raise Exception(f"HTTP {r.status_code}")
+                total_size = int(r.headers.get("content-length", 0))
+                downloaded = 0
+                with open(output_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1024*1024):
+                        if chunk:
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            elapsed = time.time() - start_time
+                            speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                            mb_cur = downloaded / (1024 * 1024)
+                            if total_size > 0:
+                                pct = (downloaded / total_size) * 100
+                                mb_tot = total_size / (1024 * 1024)
+                                print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
+                            else:
+                                print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
+            else:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    total_size = int(resp.headers.get("Content-Length", 0))
+                    downloaded = 0
+                    with open(output_path, "wb") as f:
+                        while True:
+                            chunk = resp.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            downloaded += len(chunk)
+                            elapsed = time.time() - start_time
+                            speed = (downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                            mb_cur = downloaded / (1024 * 1024)
+                            if total_size > 0:
+                                pct = (downloaded / total_size) * 100
+                                mb_tot = total_size / (1024 * 1024)
+                                print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
+                            else:
+                                print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
+            print()
+            return output_path.exists() and output_path.stat().st_size >= min_size
+        except Exception as e:
+            print(f"\n    [!] Download attempt {attempt} failed: {e}. Retrying...", file=sys.stderr)
+            time.sleep(3)
 
-    proc = subprocess.run(base_cmd)
-    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
+    return False
 
-def download_stream(url: str, output_path: Path, engine: str = "python", connections: int = 1, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0, proxy: Optional[str] = None) -> bool:
-    if engine == "python":
-        return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb, proxy=proxy)
-    elif engine == "curl":
-        ok = download_file_curl(url, output_path, min_size=min_size, max_speed_mb=max_speed_mb)
-        if ok:
-            return True
-        print("    [!] curl failed, falling back to python stream downloader...", file=sys.stderr)
-        return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb, proxy=proxy)
-    elif engine == "aria2c":
-        res = subprocess.run(["which", "aria2c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if res.returncode == 0:
-            ok = download_file_aria2c(url, output_path, connections=connections, min_size=min_size, max_speed_mb=max_speed_mb)
-            if ok:
-                return True
-            print("    [!] aria2c failed, falling back to python stream downloader...", file=sys.stderr)
-    return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb, proxy=proxy)
-
-def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0, ep_num: int = 1) -> bool:
-    """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for 100% Netflix lip-sync."""
+def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 0.0, ep_num: int = 1) -> bool:
+    """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for lip-sync."""
     delay_ms = int(delay_seconds * 1000)
     if ep_num == 1:
         # Episode 1 contains a 15.8-second commercial ad inserted between 1456.0s and 1471.8s
-        # Splice Part 1 (0 to 1456.0s) and Part 2 (1471.8s to end), then apply delay
-        filter_str = f"[0:a]asplit=2[a1][a2]; [a1]atrim=0:1456.0,asetpts=PTS-STARTPTS[p1]; [a2]atrim=start=1471.8,asetpts=PTS-STARTPTS[p2]; [p1][p2]concat=n=2:v=0:a=1[acut]; [acut]adelay={delay_ms}|{delay_ms}[aout]"
+        filter_str = f"[0:a]asplit=2[a1][a2]; [a1]atrim=0:1456.0,asetpts=PTS-STARTPTS[p1]; [a2]atrim=start=1471.8,asetpts=PTS-STARTPTS[p2]; [p1][p2]concat=n=2:v=0:a=1[acut]; [acut]adelay={delay_ms}|{delay_ms}[aout]" if abs(delay_seconds) > 0.001 else f"[0:a]asplit=2[a1][a2]; [a1]atrim=0:1456.0,asetpts=PTS-STARTPTS[p1]; [a2]atrim=start=1471.8,asetpts=PTS-STARTPTS[p2]; [p1][p2]concat=n=2:v=0:a=1[aout]"
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_video),
@@ -338,6 +274,7 @@ def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: 
     return proc.returncode == 0 and output_aac.exists() and output_aac.stat().st_size > 500000
 
 def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
+    """Losslessly remuxes 1080p Video + Khmer Audio (Default) + Original Audio into MKV."""
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
@@ -394,7 +331,17 @@ def load_progress(state_file: Path) -> Dict[str, Any]:
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
-def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pixeldrain_key: Optional[str], work_dir: Path, downloader: str = "python", connections: int = 1, audio_delay: float = 1.0, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None, max_speed_mb: float = 10.0, proxy: Optional[str] = None):
+def process_pipeline(
+    start_ep: int,
+    end_ep: int,
+    gdrive_dir: Optional[Path],
+    pixeldrain_key: Optional[str],
+    work_dir: Path,
+    source: str = "torrent",
+    custom_torrent: Optional[str] = None,
+    audio_delay: float = 0.0,
+    manual_audio_url: Optional[str] = None
+):
     catalog = load_khmer_catalog()
     work_dir.mkdir(parents=True, exist_ok=True)
     
@@ -404,16 +351,13 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
     links_file = state_dir / "pixeldrain_links.txt"
     progress = load_progress(state_file)
 
-    active_proxy = get_default_proxy(proxy)
+    torrent_source = find_torrent_source(custom_torrent) if source == "torrent" else None
 
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
-    print(f"📡 1080p Video Source: st.111477.xyz / Manual Override")
+    print(f"📡 1080p Video Source: {'Jiang Hu 1080p Torrent (aria2c)' if source == 'torrent' else 'HTTP Stream'}")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
-    print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Hardware Physical Padding)")
-    print(f"🚀 Speed Limit: {max_speed_mb:.1f} MB/s (Anti-Throttling Protection)")
-    if active_proxy:
-        print(f"🛡️  Proxy / WARP: {active_proxy}")
+    print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Lip Sync Padding)")
     if pixeldrain_key:
         print(f"⚡ PixelDrain Upload: ENABLED")
     if gdrive_dir:
@@ -425,7 +369,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
             print(f"[✓] Episode {ep_num:02d} already completed. Skipping.")
             continue
 
-        target_name = f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
+        target_name = f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.KhmerDub.mkv"
         final_gdrive_path = (gdrive_dir / target_name) if gdrive_dir else None
 
         if final_gdrive_path and final_gdrive_path.exists() and final_gdrive_path.stat().st_size > 100000000:
@@ -437,52 +381,48 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
         print(f"\n--- [ Processing Episode {ep_num:02d} / {end_ep:02d} ] ---")
         ep_data = catalog[ep_num - 1] if catalog and ep_num - 1 < len(catalog) else {}
 
-        temp_raw_video = work_dir / f"raw_1080p_e{ep_num:02d}.mkv"
         temp_audio_mp4 = work_dir / f"raw_komsan_e{ep_num:02d}.mp4"
         temp_khmer_aac = work_dir / f"khmer_audio_e{ep_num:02d}.aac"
         temp_final_mkv = work_dir / target_name
 
-        # 1. Resolve or Use Manual 1080p Video Stream
-        video_stream_url = manual_video_url if (manual_video_url and ep_num == start_ep) else None
-        if not video_stream_url:
-            print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
-            video_stream_url = resolve_1080p_stream_url(ep_num, proxy=active_proxy)
-        else:
-            print(f"[1/4] 🔗 Using manual video stream URL.")
-
-        if not video_stream_url:
-            print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
-            continue
-        print(f"    [+] 1080p Stream URL ready.")
-        time.sleep(2)  # Cooldown pause for stream handshake
-
-        print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
-        if not download_stream(video_stream_url, temp_raw_video, engine=downloader, connections=connections, min_size=50000000, desc="1080p Video", max_speed_mb=max_speed_mb, proxy=active_proxy):
-            print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
+        # 1. Download 1080p Video via Torrent (aria2c)
+        print(f"[1/4] 📥 Fetching 1080p video for Episode {ep_num:02d} via Torrent...")
+        raw_video_path = download_torrent_episode(ep_num, work_dir, torrent_source)
+        if not raw_video_path or not raw_video_path.exists():
+            print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
-        # 2. Download Khmer Audio Stream & Apply Hardware Sync Delay
-        print(f"[3/4] 🎙️ Downloading Khmer audio stream from TheKomsan...")
+        # 2. Download Khmer Audio Stream from TheKomsan
+        print(f"[2/4] 🎙️ Downloading Khmer audio stream from TheKomsan...")
         audio_stream_url = manual_audio_url or ep_data.get("file")
         if not audio_stream_url:
             print(f"[-] No audio URL found for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
-            if temp_raw_video.exists(): temp_raw_video.unlink()
+            if raw_video_path.exists(): raw_video_path.unlink()
             continue
 
-        if not download_stream(audio_stream_url, temp_audio_mp4, engine=downloader, connections=min(connections, 4), min_size=10000000, desc="Khmer Audio", max_speed_mb=max_speed_mb, proxy=active_proxy):
+        if not download_file_python(audio_stream_url, temp_audio_mp4, min_size=10000000, desc="Khmer Audio"):
             print(f"[-] Audio download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
-            if temp_raw_video.exists(): temp_raw_video.unlink()
+            if raw_video_path.exists(): raw_video_path.unlink()
             continue
 
-        print(f"    ⏱️ Applying physical +{audio_delay:.3f}s sync padding to audio...")
+        # 3. Apply Audio Delay & Ad Cut
+        print(f"[3/4] ⏱️ Applying +{audio_delay:.3f}s sync padding to audio...")
         extract_and_delay_audio(temp_audio_mp4, temp_khmer_aac, delay_seconds=audio_delay, ep_num=ep_num)
         if temp_audio_mp4.exists(): temp_audio_mp4.unlink()
 
-        # 3. Losslessly Remux 1080p Video + Khmer Audio + Mandarin + Subtitles
+        # 4. Losslessly Remux 1080p Video + Khmer Audio + Original Audio
         print(f"[4/4] ⚡ Losslessly remuxing into 1080p Dual-Audio MKV...")
-        mux_ok = remux_local_streams(temp_raw_video, temp_khmer_aac, temp_final_mkv, ep_num)
-        if temp_raw_video.exists(): temp_raw_video.unlink()
-        if temp_khmer_aac.exists(): temp_khmer_aac.unlink()
+        mux_ok = remux_local_streams(raw_video_path, temp_khmer_aac, temp_final_mkv, ep_num)
+        
+        # Immediate cleanup of raw video & audio to keep disk usage strictly under 3GB
+        if raw_video_path.exists():
+            raw_video_path.unlink()
+        if temp_khmer_aac.exists():
+            temp_khmer_aac.unlink()
+        # Clean aria2 control files
+        for f in work_dir.glob("*.aria2"):
+            try: f.unlink()
+            except Exception: pass
 
         if not mux_ok:
             print(f"[-] Remuxing failed for Episode {ep_num:02d}.", file=sys.stderr)
@@ -513,7 +453,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Google Colab 1080p Netflix Three Kingdoms Khmer Dub Remuxer."
+        description="Google Colab 1080p Three Kingdoms Khmer Dub Remuxer (Torrent & TheKomsan)."
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
@@ -522,12 +462,9 @@ def main():
     parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
-    parser.add_argument("-d", "--downloader", type=str, choices=["python", "curl", "aria2c"], default="python", help="Downloader engine (default: python)")
-    parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download")
-    parser.add_argument("--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
-    parser.add_argument("--max-speed", type=float, default=10.0, help="Maximum download speed in MB/s to prevent Cloudflare burst limits (default: 10.0)")
-    parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (e.g. 'socks5://127.0.0.1:40000' for Cloudflare WARP)")
-    parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
+    parser.add_argument("--source", type=str, choices=["torrent", "http"], default="torrent", help="Video source (default: torrent)")
+    parser.add_argument("--torrent", type=str, default=None, help="Path to .torrent file or magnet link")
+    parser.add_argument("--delay", type=float, default=0.0, help="Audio delay in seconds (default: 0.0 for Jiang Hu broadcast cut)")
     parser.add_argument("--audio-url", type=str, default=None, help="Manual Khmer audio URL override for the episode")
 
     args = parser.parse_args()
@@ -541,13 +478,10 @@ def main():
         gdrive_dir=gdrive_dir,
         pixeldrain_key=pd_key,
         work_dir=Path(args.work_dir),
-        downloader=args.downloader,
-        connections=args.connections,
+        source=args.source,
+        custom_torrent=args.torrent,
         audio_delay=args.delay,
-        manual_video_url=args.video_url,
-        manual_audio_url=args.audio_url,
-        max_speed_mb=args.max_speed,
-        proxy=args.proxy
+        manual_audio_url=args.audio_url
     )
 
 if __name__ == "__main__":

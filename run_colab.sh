@@ -2,12 +2,13 @@
 set -e
 
 echo "=================================================================="
-echo "🎬 Setting up Samkok 1080p Pipeline for Google Colab..."
+echo "🎬 Setting up Samkok 1080p Torrent Pipeline for Google Colab..."
 echo "=================================================================="
 
-# 1. Disconnect WARP proxy if active to prevent Cloudflare loopback blocks
-if command -v warp-cli &> /dev/null; then
-    warp-cli disconnect 2>/dev/null || true
+# 1. Install aria2 BitTorrent engine if not present
+if ! command -v aria2c &> /dev/null; then
+    echo "[+] Installing aria2 BitTorrent client..."
+    apt-get update -qq && apt-get install -y -qq aria2
 fi
 
 # 2. Install python dependencies
