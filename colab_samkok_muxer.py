@@ -7,6 +7,7 @@ Seamlessly processes episodes in Google Colab:
 - Extracts Khmer AAC audio from TheKomsan (Rumble CDN) or manual audio URL
 - Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles
 - Saves directly into mounted Google Drive (/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer)
+- Supports aria2c and curl download engines with configurable single or multi-connection
 """
 
 import sys
@@ -62,11 +63,38 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(2)
     return None
 
+def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_size: int = 1000000) -> bool:
+    """Download using aria2c with custom connections (default 1 for rate-limit protection)."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Remove 0-byte corrupted file if any
+    if output_path.exists() and output_path.stat().st_size == 0:
+        output_path.unlink()
+        
+    cmd = [
+        "aria2c",
+        "-x", str(connections),
+        "-s", str(connections),
+        "-k", "1M",
+        "-d", str(output_path.parent),
+        "-o", output_path.name,
+        "-U", USER_AGENT,
+        f"--header=Referer: https://st.111477.xyz/",
+        f"--header=Origin: https://st.111477.xyz",
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
+        "--summary-interval=5",
+        "--max-tries=10",
+        "--retry-wait=3",
+        url
+    ]
+    proc = subprocess.run(cmd)
+    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
+
 def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> bool:
     """Download single-stream via curl with clean error recovery and no Range header conflicts."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    # If 0-byte corrupted file exists, remove it
     if output_path.exists() and output_path.stat().st_size == 0:
         output_path.unlink()
 
@@ -94,7 +122,6 @@ def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> 
 
     proc = subprocess.run(cmd)
 
-    # If curl failed (e.g. error 33 byte-range unsupported), remove file and retry fresh from offset 0
     if proc.returncode != 0 or not (output_path.exists() and output_path.stat().st_size >= min_size):
         if output_path.exists():
             output_path.unlink()
@@ -103,6 +130,17 @@ def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> 
         proc = subprocess.run(fresh_cmd)
 
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
+
+def download_stream(url: str, output_path: Path, engine: str = "aria2c", connections: int = 1, min_size: int = 1000000) -> bool:
+    """Dispatches download to selected engine (aria2c or curl)."""
+    if engine == "aria2c":
+        # Check if aria2c is installed
+        res = subprocess.run(["which", "aria2c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if res.returncode == 0:
+            return download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
+        else:
+            print("    [!] aria2c not found, falling back to curl...")
+    return download_file_curl(url, output_path, min_size=min_size)
 
 def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
     cmd = [
@@ -151,7 +189,7 @@ def load_progress(state_file: Path) -> Dict[str, Any]:
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
-def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Path, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None, manual_urls_file: Optional[Path] = None):
+def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Path, downloader: str = "aria2c", connections: int = 1, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None, manual_urls_file: Optional[Path] = None):
     catalog = load_khmer_catalog()
     manual_urls_map = {}
     if manual_urls_file and manual_urls_file.exists():
@@ -169,6 +207,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
     print(f"📡 1080p Video Source: st.111477.xyz / Manual Override")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
+    print(f"⚡ Downloader Engine: {downloader.upper()} (Connections: {connections})")
     print(f"📁 Output Target (GDrive): {gdrive_dir}")
     print(f"{'='*80}\n")
 
@@ -207,8 +246,8 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
             continue
         print(f"    [+] 1080p Stream URL ready.")
 
-        print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
-        if not download_file_curl(video_stream_url, temp_raw_video, min_size=50000000):
+        print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB) with {downloader} ({connections} conn)...")
+        if not download_stream(video_stream_url, temp_raw_video, engine=downloader, connections=connections, min_size=50000000):
             print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
             print(f"    👉 TIP: If Cloudflare blocks automated download, provide direct link with --video-url \"<url>\".", file=sys.stderr)
             continue
@@ -221,7 +260,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
-        if not download_file_curl(audio_stream_url, temp_audio_mp4, min_size=10000000):
+        if not download_stream(audio_stream_url, temp_audio_mp4, engine=downloader, connections=min(connections, 4), min_size=10000000):
             print(f"[-] Audio download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
@@ -259,6 +298,8 @@ def main():
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
+    parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="aria2c", help="Downloader engine (default: aria2c)")
+    parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download (default: 1)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
     parser.add_argument("--audio-url", type=str, default=None, help="Manual Khmer audio URL override for the episode")
     parser.add_argument("--manual-urls", type=str, default=None, help="JSON file mapping episode numbers to manual video URLs")
@@ -269,6 +310,8 @@ def main():
         end_ep=args.end,
         gdrive_dir=Path(args.gdrive_dir),
         work_dir=Path(args.work_dir),
+        downloader=args.downloader,
+        connections=args.connections,
         manual_video_url=args.video_url,
         manual_audio_url=args.audio_url,
         manual_urls_file=Path(args.manual_urls) if args.manual_urls else None
