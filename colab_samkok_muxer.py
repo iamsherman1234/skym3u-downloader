@@ -3,8 +3,8 @@
 Samkok 1080p Netflix Khmer Dub Muxer for Google Colab
 Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Netflix 1080p WEB-DL (st.111477.xyz)
 Seamlessly processes episodes in Google Colab:
-- Resolves 1080p Netflix stream from st.111477.xyz
-- Extracts Khmer AAC audio from TheKomsan (Rumble CDN)
+- Resolves 1080p Netflix stream from st.111477.xyz or uses manual URL override
+- Extracts Khmer AAC audio from TheKomsan (Rumble CDN) or manual audio URL
 - Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles
 - Saves directly into mounted Google Drive (/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer)
 """
@@ -23,7 +23,7 @@ from typing import List, Dict, Any, Optional
 SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 AUDIO_SYNC_OFFSET = "0.940"  # Seconds to trim from Khmer audio for Netflix 1080p alignment
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
@@ -51,7 +51,7 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": "https://st.111477.xyz/"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 streams = data.get("streams", [])
@@ -62,14 +62,47 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(2)
     return None
 
+def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> bool:
+    """Download single-stream via curl with auto-resume and browser headers."""
+    cmd = [
+        "curl",
+        "-C", "-",
+        "-L",
+        "--retry", "10",
+        "--retry-delay", "3",
+        "--retry-all-errors",
+        "--connect-timeout", "20",
+        "--speed-time", "30",
+        "--speed-limit", "1000",
+        "-A", USER_AGENT,
+        "-H", "Referer: https://st.111477.xyz/",
+        "-H", "Origin: https://st.111477.xyz",
+        "--progress-bar",
+        "-o", str(output_path),
+        url
+    ]
+    proc = subprocess.run(cmd)
+    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
+
 def download_chunked_robust(url: str, output_path: Path, label: str = "File", min_size: int = 1000000, max_retries: int = 10) -> bool:
-    """Robust chunked downloader with HTTP Range resumption and retry loop."""
+    """Robust single-connection downloader with fallback to curl."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # Try single-connection curl first (handles Cloudflare tokens and range headers best)
+    print(f"    📥 Downloading [{label}] via single stream...")
+    if download_file_curl(url, output_path, min_size=min_size):
+        return True
+
+    print(f"    [!] Curl encountered issue, attempting Python single connection...")
     block_size = 2 * 1024 * 1024  # 2 MB chunks
 
     for attempt in range(max_retries):
         downloaded = output_path.stat().st_size if output_path.exists() else 0
-        headers = {"User-Agent": USER_AGENT}
+        headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": "https://st.111477.xyz/",
+            "Accept": "*/*"
+        }
         if downloaded > 0:
             headers["Range"] = f"bytes={downloaded}-"
 
@@ -112,7 +145,7 @@ def download_chunked_robust(url: str, output_path: Path, label: str = "File", mi
                 return True
 
         except Exception as e:
-            print(f"\n    [!] Connection error ({e}). Retrying ({attempt+1}/{max_retries})...")
+            print(f"\n    [!] Connection notice ({e}). Retrying ({attempt+1}/{max_retries})...")
             time.sleep(3)
 
     return output_path.exists() and output_path.stat().st_size >= min_size
@@ -164,11 +197,14 @@ def load_progress(state_file: Path) -> Dict[str, Any]:
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
-def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Path):
+def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Path, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None, manual_urls_file: Optional[Path] = None):
     catalog = load_khmer_catalog()
-    if not catalog:
-        print("[-] Catalog is empty or could not be loaded.", file=sys.stderr)
-        return
+    manual_urls_map = {}
+    if manual_urls_file and manual_urls_file.exists():
+        try:
+            manual_urls_map = json.loads(manual_urls_file.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[-] Could not load manual URLs file: {e}")
 
     work_dir.mkdir(parents=True, exist_ok=True)
     gdrive_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +213,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
 
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
-    print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
+    print(f"📡 1080p Video Source: st.111477.xyz / Manual Override")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"📁 Output Target (GDrive): {gdrive_dir}")
     print(f"{'='*80}\n")
@@ -197,31 +233,37 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
             continue
 
         print(f"\n--- [ Processing Episode {ep_num:02d} / {end_ep:02d} ] ---")
-        ep_data = catalog[ep_num - 1]
+        ep_data = catalog[ep_num - 1] if catalog and ep_num - 1 < len(catalog) else {}
 
         temp_raw_video = work_dir / f"raw_1080p_e{ep_num:02d}.mkv"
         temp_audio_mp4 = work_dir / f"raw_komsan_e{ep_num:02d}.mp4"
         temp_khmer_aac = work_dir / f"khmer_audio_e{ep_num:02d}.aac"
         temp_final_mkv = work_dir / target_name
 
-        # 1. Resolve & Download 1080p Video Stream
-        print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
-        video_stream_url = resolve_1080p_stream_url(ep_num)
+        # 1. Resolve or Use Manual 1080p Video Stream
+        video_stream_url = manual_video_url or manual_urls_map.get(str(ep_num)) or manual_urls_map.get(ep_num)
         if not video_stream_url:
-            print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+            print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
+            video_stream_url = resolve_1080p_stream_url(ep_num)
+        else:
+            print(f"[1/4] 🔗 Using manual video stream URL.")
+
+        if not video_stream_url:
+            print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. You can pass --video-url \"<url>\". Skipping.", file=sys.stderr)
             continue
-        print(f"    [+] 1080p Stream URL resolved.")
+        print(f"    [+] 1080p Stream URL ready.")
 
         print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
         if not download_chunked_robust(video_stream_url, temp_raw_video, label=f"Video E{ep_num:02d}", min_size=50000000):
-            print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+            print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
+            print(f"    👉 TIP: If Cloudflare blocks automated download with 429, you can provide a direct link with --video-url \"<url>\".", file=sys.stderr)
             continue
 
         # 2. Download Khmer Audio Stream
         print(f"[3/4] 🎙️ Downloading Khmer audio stream from TheKomsan...")
-        audio_stream_url = ep_data.get("file")
+        audio_stream_url = manual_audio_url or ep_data.get("file")
         if not audio_stream_url:
-            print(f"[-] No audio URL found in catalog for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
+            print(f"[-] No audio URL found for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
@@ -263,13 +305,19 @@ def main():
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
+    parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
+    parser.add_argument("--audio-url", type=str, default=None, help="Manual Khmer audio URL override for the episode")
+    parser.add_argument("--manual-urls", type=str, default=None, help="JSON file mapping episode numbers to manual video URLs")
 
     args = parser.parse_args()
     process_pipeline(
         start_ep=args.start,
         end_ep=args.end,
         gdrive_dir=Path(args.gdrive_dir),
-        work_dir=Path(args.work_dir)
+        work_dir=Path(args.work_dir),
+        manual_video_url=args.video_url,
+        manual_audio_url=args.audio_url,
+        manual_urls_file=Path(args.manual_urls) if args.manual_urls else None
     )
 
 if __name__ == "__main__":
