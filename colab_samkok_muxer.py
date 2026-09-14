@@ -134,25 +134,38 @@ def download_stream(url: str, output_path: Path, engine: str = "aria2c", connect
             return download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
     return download_file_curl(url, output_path, min_size=min_size)
 
-def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0) -> bool:
-    """Extracts audio and applies physical silence padding so sync works reliably on all media players."""
-    if abs(delay_seconds) > 0.01:
-        delay_ms = int(delay_seconds * 1000)
+def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0, ep_num: int = 1) -> bool:
+    """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for 100% Netflix lip-sync."""
+    delay_ms = int(delay_seconds * 1000)
+    if ep_num == 1:
+        # Episode 1 contains a 15.8-second commercial ad inserted between 1456.0s and 1471.8s
+        # Splice Part 1 (0 to 1456.0s) and Part 2 (1471.8s to end), then apply delay
+        filter_str = f"[0:a]asplit=2[a1][a2]; [a1]atrim=0:1456.0,asetpts=PTS-STARTPTS[p1]; [a2]atrim=start=1471.8,asetpts=PTS-STARTPTS[p2]; [p1][p2]concat=n=2:v=0:a=1[acut]; [acut]adelay={delay_ms}|{delay_ms}[aout]"
         cmd = [
             "ffmpeg", "-y",
             "-i", str(input_video),
-            "-vn",
-            "-filter:a", f"adelay={delay_ms}|{delay_ms}",
-            "-c:a", "aac", "-b:a", "128k",
+            "-filter_complex", filter_str,
+            "-map", "[aout]",
+            "-c:a", "aac", "-b:a", "192k",
             str(output_aac)
         ]
     else:
-        cmd = [
-            "ffmpeg", "-y",
-            "-i", str(input_video),
-            "-vn", "-c:a", "copy",
-            str(output_aac)
-        ]
+        if abs(delay_seconds) > 0.01:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(input_video),
+                "-vn",
+                "-filter:a", f"adelay={delay_ms}|{delay_ms}",
+                "-c:a", "aac", "-b:a", "192k",
+                str(output_aac)
+            ]
+        else:
+            cmd = [
+                "ffmpeg", "-y",
+                "-i", str(input_video),
+                "-vn", "-c:a", "copy",
+                str(output_aac)
+            ]
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc.returncode == 0 and output_aac.exists() and output_aac.stat().st_size > 500000
 
@@ -175,7 +188,6 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
         "-disposition:a:0", "default",
         "-disposition:a:1", "none",
         "-metadata", f"title=Three Kingdoms (2010) - Episode {ep_num:02d} [1080p Khmer Dubbed]",
-        "-t", "2618",
         str(output_mkv)
     ]
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -289,7 +301,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
             continue
 
         print(f"    ⏱️ Applying physical +{audio_delay:.3f}s sync padding to audio...")
-        extract_and_delay_audio(temp_audio_mp4, temp_khmer_aac, delay_seconds=audio_delay)
+        extract_and_delay_audio(temp_audio_mp4, temp_khmer_aac, delay_seconds=audio_delay, ep_num=ep_num)
         if temp_audio_mp4.exists(): temp_audio_mp4.unlink()
 
         # 3. Losslessly Remux 1080p Video + Khmer Audio + Mandarin + Subtitles
@@ -332,7 +344,7 @@ def main():
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
     parser.add_argument("-p", "--pixeldrain", action="store_true", help="Enable PixelDrain auto-upload")
-    parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
+    parser.add_argument("--pixeldrain-key", type=str, default=None, help="PixelDrain API key")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
     parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="aria2c", help="Downloader engine")
@@ -343,7 +355,7 @@ def main():
 
     args = parser.parse_args()
     
-    pd_key = args.pixeldrain_key if (args.pixeldrain or args.pixeldrain_key) else None
+    pd_key = args.pixeldrain_key or (DEFAULT_PIXELDRAIN_KEY if args.pixeldrain else None)
     gdrive_dir = Path(args.gdrive_dir) if args.gdrive_dir != "none" else None
 
     process_pipeline(
