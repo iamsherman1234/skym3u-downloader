@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Samkok 1080p Netflix Muxer & Google Drive Auto-Uploader
+Samkok 1080p Netflix Muxer & PixelDrain / GDrive Auto-Uploader
 Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Netflix 1080p WEB-DL (st.111477.xyz)
 Processes episodes sequentially with rock-solid auto-resuming downloads:
 1. Resolves fresh 1080p stream URL via st.111477.xyz
-2. Downloads 1080p video with curl auto-resumption (-C -) and retries
-3. Downloads Khmer audio MP4 from TheKomsan (Rumble CDN) via aria2c/curl
+2. Downloads 1080p video with single-stream auto-resumption and retries
+3. Downloads Khmer audio MP4 from TheKomsan (Rumble CDN)
 4. Extracts AAC audio and losslessly remuxes into dual-audio 1080p MKV with Chinese subtitles
-5. Uploads to Google Drive via rclone
+5. Auto-uploads to PixelDrain (API) and/or Google Drive (rclone)
 6. Cleans up temporary files to keep disk usage minimal (< 3 GB)
 """
 
@@ -19,14 +19,16 @@ import time
 import argparse
 import subprocess
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"  # https://a.111477.xyz/
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 AUDIO_SYNC_OFFSET = "0.940"  # Seconds to trim from Khmer audio for Netflix 1080p alignment
+DEFAULT_PIXELDRAIN_KEY = "cafccc0b-66db-4f1d-a5bb-de45da49f9d5"
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
     for p in [
@@ -48,7 +50,7 @@ def load_progress(state_file: Path) -> Dict[str, Any]:
             return json.loads(state_file.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"completed": []}
+    return {"completed": [], "pixeldrain_links": {}}
 
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
@@ -57,7 +59,7 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": "https://st.111477.xyz/"})
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
                 streams = data.get("streams", [])
@@ -70,35 +72,55 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
 
 def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000) -> bool:
     """Downloads a file using curl with auto-resume, retries, and rate recovery."""
-    cmd = [
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and output_path.stat().st_size == 0:
+        output_path.unlink()
+
+    has_partial = output_path.exists() and output_path.stat().st_size > 0
+
+    base_cmd = [
         "curl",
-        "-C", "-",
         "-L",
-        "--retry", "10",
+        "--retry", "5",
         "--retry-delay", "3",
-        "--retry-all-errors",
         "--connect-timeout", "20",
         "--speed-time", "30",
         "--speed-limit", "1000",
         "-A", USER_AGENT,
+        "-H", "Referer: https://st.111477.xyz/",
+        "-H", "Origin: https://st.111477.xyz",
         "--progress-bar",
-        "-o", str(output_path),
-        url
+        "-o", str(output_path)
     ]
+
+    cmd = list(base_cmd)
+    if has_partial:
+        cmd.extend(["-C", "-"])
+    cmd.append(url)
+
     proc = subprocess.run(cmd)
+
+    # Fallback retry without -C - if range error occurs
+    if proc.returncode != 0 or not (output_path.exists() and output_path.stat().st_size >= min_size):
+        if output_path.exists():
+            output_path.unlink()
+        print("    [!] Retrying fresh download...")
+        fresh_cmd = list(base_cmd) + [url]
+        proc = subprocess.run(fresh_cmd)
+
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
 def download_audio_mp4(url: str, output_path: Path) -> bool:
-    """Downloads TheKomsan MP4 via aria2c multi-connection for maximum speed, fallback to curl."""
+    """Downloads TheKomsan MP4 via aria2c or curl."""
     if output_path.exists() and output_path.stat().st_size > 10000000:
         return True
     
-    # Try aria2c first for fast multi-segment download
+    # Try aria2c first
     try:
         cmd = [
             "aria2c",
-            "-x", "8",
-            "-s", "8",
+            "-x", "4",
+            "-s", "4",
             "-k", "1M",
             "-d", str(output_path.parent),
             "-o", output_path.name,
@@ -113,7 +135,6 @@ def download_audio_mp4(url: str, output_path: Path) -> bool:
     except FileNotFoundError:
         pass
 
-    # Fallback to curl
     return download_file_resilient(url, output_path, min_size=10000000)
 
 def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
@@ -152,6 +173,31 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 10000000
 
+def upload_to_pixeldrain(local_file: Path, api_key: str) -> Optional[str]:
+    """Uploads file directly to PixelDrain using API key and returns direct link."""
+    print(f"[*] ⚡ Uploading '{local_file.name}' ({local_file.stat().st_size / (1024*1024):.1f} MB) to PixelDrain...")
+    url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(local_file.name)}"
+    cmd = [
+        "curl",
+        "-T", str(local_file),
+        "-u", f":{api_key}",
+        "--progress-bar",
+        url
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        data = json.loads(proc.stdout)
+        file_id = data.get("id")
+        if file_id:
+            pd_url = f"https://pixeldrain.com/u/{file_id}"
+            print(f"[+] 🚀 PixelDrain Upload Successful: {pd_url}")
+            return pd_url
+        else:
+            print(f"[-] PixelDrain upload response: {data}", file=sys.stderr)
+    except Exception as e:
+        print(f"[-] PixelDrain error: {e} | Raw output: {proc.stdout}", file=sys.stderr)
+    return None
+
 def upload_to_rclone(local_file: Path, remote_dest: str) -> bool:
     dest_path = f"{remote_dest.rstrip('/')}/{local_file.name}"
     print(f"[*] Uploading '{local_file.name}' to {dest_path}...")
@@ -159,13 +205,14 @@ def upload_to_rclone(local_file: Path, remote_dest: str) -> bool:
     proc = subprocess.run(cmd)
     return proc.returncode == 0
 
-def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], work_dir: Path):
+def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, video_url: Optional[str] = None):
     catalog = load_khmer_catalog()
     if not catalog:
         return
 
     work_dir.mkdir(parents=True, exist_ok=True)
     state_file = work_dir / "mux_state.json"
+    links_file = work_dir / "pixeldrain_links.txt"
     progress = load_progress(state_file)
 
     print(f"\n{'='*80}")
@@ -173,6 +220,8 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
     print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Sync Offset: -ss {AUDIO_SYNC_OFFSET}s (Verified)")
+    if pixeldrain_key:
+        print(f"⚡ PixelDrain Auto-Upload: ENABLED")
     if remote_dest:
         print(f"☁️  Google Drive Remote: {remote_dest}")
     print(f"{'='*80}\n")
@@ -191,15 +240,20 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
         final_mkv = work_dir / f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
 
         # 1. Resolve & Download 1080p Video Stream
-        print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
-        video_stream_url = resolve_1080p_stream_url(ep_num)
-        if not video_stream_url:
+        stream_link = video_url if (video_url and ep_num == start_ep) else None
+        if not stream_link:
+            print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
+            stream_link = resolve_1080p_stream_url(ep_num)
+        else:
+            print(f"[1/4] 🔗 Using manual video stream URL.")
+
+        if not stream_link:
             print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
         print(f"    [+] 1080p Stream URL resolved.")
 
         print(f"    📥 Downloading 1080p video file (~2.4 GB)...")
-        if not download_file_resilient(video_stream_url, temp_raw_video, min_size=50000000):
+        if not download_file_resilient(stream_link, temp_raw_video, min_size=50000000):
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
@@ -233,16 +287,30 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
         size_mb = final_mkv.stat().st_size / (1024 * 1024)
         print(f"[+] ✅ Created: {final_mkv.name} ({size_mb:.1f} MB)")
 
-        # 4. Upload to Google Drive (if remote configured)
+        # 4. Upload to PixelDrain
+        if pixeldrain_key:
+            print(f"[4/4] ⚡ Uploading to PixelDrain...")
+            pd_link = upload_to_pixeldrain(final_mkv, pixeldrain_key)
+            if pd_link:
+                progress.setdefault("pixeldrain_links", {})[str(ep_num)] = pd_link
+                # Append to text file
+                with open(links_file, "a", encoding="utf-8") as lf:
+                    lf.write(f"Episode {ep_num:02d}: {pd_link}\n")
+
+        # 5. Upload to Google Drive (if remote configured)
         if remote_dest:
-            print(f"[4/4] ☁️ Uploading to Google Drive...")
+            print(f"[*] ☁️ Uploading to Google Drive...")
             uploaded = upload_to_rclone(final_mkv, remote_dest)
             if uploaded:
-                print(f"[+] 🚀 Uploaded Episode {ep_num:02d} successfully!")
-                if final_mkv.exists(): final_mkv.unlink()
-                print(f"[+] 🧹 Cleaned up local temporary files.")
+                print(f"[+] 🚀 Uploaded Episode {ep_num:02d} to Google Drive successfully!")
             else:
-                print(f"[-] ⚠️ Upload failed. File retained locally at {final_mkv}", file=sys.stderr)
+                print(f"[-] ⚠️ GDrive Upload failed.", file=sys.stderr)
+
+        # Cleanup local MKV if uploaded to cloud
+        if pixeldrain_key or remote_dest:
+            if final_mkv.exists():
+                final_mkv.unlink()
+                print(f"[+] 🧹 Cleaned up local video file to save disk space.")
         else:
             print(f"[+] 💾 Saved locally at: {final_mkv}")
 
@@ -254,22 +322,34 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], wor
         time.sleep(3)
 
     print(f"\n🎉 All requested episodes successfully finished!")
+    if pixeldrain_key and links_file.exists():
+        print(f"\n📋 All PixelDrain Links saved to: {links_file}")
+        print(links_file.read_text(encoding="utf-8"))
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Automated 1080p Netflix Three Kingdoms Khmer Dub Remuxer & GDrive Uploader."
+        description="Automated 1080p Netflix Three Kingdoms Khmer Dub Remuxer with PixelDrain & GDrive Uploader."
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
-    parser.add_argument("-r", "--remote", type=str, default="chumlayan95_google_drive_1773847968:ThreeKingdoms_1080p_Khmer", help="Rclone remote destination")
-    parser.add_argument("-w", "--work-dir", type=str, default="/root/samkok_1080p_work", help="Working directory")
+    parser.add_argument("-p", "--pixeldrain", action="store_true", help="Enable PixelDrain auto-upload with default key")
+    parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
+    parser.add_argument("-r", "--remote", type=str, default="none", help="Rclone remote destination (default: none)")
+    parser.add_argument("-w", "--work-dir", type=str, default="./samkok_work", help="Working directory")
+    parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for start episode")
 
     args = parser.parse_args()
+    
+    # Enable pixeldrain key if flag is set or key explicitly given
+    pd_key = args.pixeldrain_key if (args.pixeldrain or args.pixeldrain_key) else None
+
     process_pipeline(
         start_ep=args.start,
         end_ep=args.end,
         remote_dest=args.remote if args.remote != "none" else None,
-        work_dir=Path(args.work_dir)
+        pixeldrain_key=pd_key,
+        work_dir=Path(args.work_dir),
+        video_url=args.video_url
     )
 
 if __name__ == "__main__":

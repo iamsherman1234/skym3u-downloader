@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Samkok 1080p Netflix Khmer Dub Muxer for Google Colab
+Samkok 1080p Netflix Khmer Dub Muxer with PixelDrain & GDrive Uploader for Google Colab
 Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Netflix 1080p WEB-DL (st.111477.xyz)
 Seamlessly processes episodes in Google Colab:
 - Resolves 1080p Netflix stream from st.111477.xyz or uses manual URL override
 - Extracts Khmer AAC audio from TheKomsan (Rumble CDN) or manual audio URL
 - Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles
-- Saves directly into mounted Google Drive (/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer)
-- Supports aria2c and curl download engines with configurable single or multi-connection
+- Auto-uploads directly to PixelDrain and/or mounted Google Drive
 """
 
 import sys
@@ -18,6 +17,7 @@ import time
 import argparse
 import subprocess
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -26,6 +26,7 @@ STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 AUDIO_SYNC_OFFSET = "0.940"  # Seconds to trim from Khmer audio for Netflix 1080p alignment
+DEFAULT_PIXELDRAIN_KEY = "cafccc0b-66db-4f1d-a5bb-de45da49f9d5"
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
     candidates = [
@@ -64,10 +65,7 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     return None
 
 def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_size: int = 1000000) -> bool:
-    """Download using aria2c with custom connections (default 1 for rate-limit protection)."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Remove 0-byte corrupted file if any
     if output_path.exists() and output_path.stat().st_size == 0:
         output_path.unlink()
         
@@ -92,14 +90,11 @@ def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
 def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> bool:
-    """Download single-stream via curl with clean error recovery and no Range header conflicts."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    
     if output_path.exists() and output_path.stat().st_size == 0:
         output_path.unlink()
 
     has_partial = output_path.exists() and output_path.stat().st_size > 0
-
     base_cmd = [
         "curl",
         "-L",
@@ -125,21 +120,17 @@ def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> 
     if proc.returncode != 0 or not (output_path.exists() and output_path.stat().st_size >= min_size):
         if output_path.exists():
             output_path.unlink()
-        print("    [!] Retrying fresh download from start...")
+        print("    [!] Retrying fresh download...")
         fresh_cmd = list(base_cmd) + [url]
         proc = subprocess.run(fresh_cmd)
 
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
 def download_stream(url: str, output_path: Path, engine: str = "aria2c", connections: int = 1, min_size: int = 1000000) -> bool:
-    """Dispatches download to selected engine (aria2c or curl)."""
     if engine == "aria2c":
-        # Check if aria2c is installed
         res = subprocess.run(["which", "aria2c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode == 0:
             return download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
-        else:
-            print("    [!] aria2c not found, falling back to curl...")
     return download_file_curl(url, output_path, min_size=min_size)
 
 def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
@@ -178,37 +169,57 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
     proc = subprocess.run(cmd, capture_output=True, text=True)
     return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 10000000
 
+def upload_to_pixeldrain(local_file: Path, api_key: str) -> Optional[str]:
+    print(f"[*] ⚡ Uploading '{local_file.name}' to PixelDrain...")
+    url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(local_file.name)}"
+    cmd = [
+        "curl",
+        "-T", str(local_file),
+        "-u", f":{api_key}",
+        "--progress-bar",
+        url
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        data = json.loads(proc.stdout)
+        file_id = data.get("id")
+        if file_id:
+            pd_url = f"https://pixeldrain.com/u/{file_id}"
+            print(f"[+] 🚀 PixelDrain Upload Successful: {pd_url}")
+            return pd_url
+    except Exception as e:
+        print(f"[-] PixelDrain error: {e}")
+    return None
+
 def load_progress(state_file: Path) -> Dict[str, Any]:
     if state_file.exists():
         try:
             return json.loads(state_file.read_text(encoding="utf-8"))
         except Exception:
             pass
-    return {"completed": []}
+    return {"completed": [], "pixeldrain_links": {}}
 
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
-def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Path, downloader: str = "aria2c", connections: int = 1, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None, manual_urls_file: Optional[Path] = None):
+def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pixeldrain_key: Optional[str], work_dir: Path, downloader: str = "aria2c", connections: int = 1, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None):
     catalog = load_khmer_catalog()
-    manual_urls_map = {}
-    if manual_urls_file and manual_urls_file.exists():
-        try:
-            manual_urls_map = json.loads(manual_urls_file.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"[-] Could not load manual URLs file: {e}")
-
     work_dir.mkdir(parents=True, exist_ok=True)
-    gdrive_dir.mkdir(parents=True, exist_ok=True)
-    state_file = gdrive_dir / "mux_state.json"
+    
+    state_dir = gdrive_dir if gdrive_dir else work_dir
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_file = state_dir / "mux_state.json"
+    links_file = state_dir / "pixeldrain_links.txt"
     progress = load_progress(state_file)
 
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
     print(f"📡 1080p Video Source: st.111477.xyz / Manual Override")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
-    print(f"⚡ Downloader Engine: {downloader.upper()} (Connections: {connections})")
-    print(f"📁 Output Target (GDrive): {gdrive_dir}")
+    if pixeldrain_key:
+        print(f"⚡ PixelDrain Upload: ENABLED")
+    if gdrive_dir:
+        print(f"📁 Output Target (GDrive): {gdrive_dir}")
     print(f"{'='*80}\n")
 
     for ep_num in range(start_ep, end_ep + 1):
@@ -217,9 +228,9 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
             continue
 
         target_name = f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
-        final_gdrive_path = gdrive_dir / target_name
+        final_gdrive_path = (gdrive_dir / target_name) if gdrive_dir else None
 
-        if final_gdrive_path.exists() and final_gdrive_path.stat().st_size > 100000000:
+        if final_gdrive_path and final_gdrive_path.exists() and final_gdrive_path.stat().st_size > 100000000:
             print(f"[✓] File already exists on Google Drive ({target_name}). Skipping.")
             progress["completed"].append(ep_num)
             save_progress(state_file, progress)
@@ -234,7 +245,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
         temp_final_mkv = work_dir / target_name
 
         # 1. Resolve or Use Manual 1080p Video Stream
-        video_stream_url = manual_video_url or manual_urls_map.get(str(ep_num)) or manual_urls_map.get(ep_num)
+        video_stream_url = manual_video_url if (manual_video_url and ep_num == start_ep) else None
         if not video_stream_url:
             print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
             video_stream_url = resolve_1080p_stream_url(ep_num)
@@ -242,14 +253,13 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
             print(f"[1/4] 🔗 Using manual video stream URL.")
 
         if not video_stream_url:
-            print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. You can pass --video-url \"<url>\". Skipping.", file=sys.stderr)
+            print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
         print(f"    [+] 1080p Stream URL ready.")
 
-        print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB) with {downloader} ({connections} conn)...")
+        print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
         if not download_stream(video_stream_url, temp_raw_video, engine=downloader, connections=connections, min_size=50000000):
             print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
-            print(f"    👉 TIP: If Cloudflare blocks automated download, provide direct link with --video-url \"<url>\".", file=sys.stderr)
             continue
 
         # 2. Download Khmer Audio Stream
@@ -278,14 +288,26 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
             print(f"[-] Remuxing failed for Episode {ep_num:02d}.", file=sys.stderr)
             continue
 
-        # Move to GDrive directly
-        print(f"[*] 🚀 Saving directly to Google Drive: {final_gdrive_path}")
-        temp_final_mkv.replace(final_gdrive_path)
+        # Upload to PixelDrain
+        if pixeldrain_key:
+            pd_link = upload_to_pixeldrain(temp_final_mkv, pixeldrain_key)
+            if pd_link:
+                progress.setdefault("pixeldrain_links", {})[str(ep_num)] = pd_link
+                with open(links_file, "a", encoding="utf-8") as lf:
+                    lf.write(f"Episode {ep_num:02d}: {pd_link}\n")
+
+        # Save to Google Drive if configured
+        if final_gdrive_path:
+            print(f"[*] 🚀 Copying directly to Google Drive: {final_gdrive_path}")
+            temp_final_mkv.replace(final_gdrive_path)
+        elif pixeldrain_key and temp_final_mkv.exists():
+            # Delete local file after PixelDrain upload to keep disk clean
+            temp_final_mkv.unlink()
 
         # Mark episode completed
         progress["completed"].append(ep_num)
         save_progress(state_file, progress)
-        print(f"[✓] Episode {ep_num:02d} completed and saved!")
+        print(f"[✓] Episode {ep_num:02d} completed successfully!")
         time.sleep(2)
 
     print(f"\n🎉 All requested episodes successfully finished!")
@@ -296,25 +318,30 @@ def main():
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
-    parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory")
+    parser.add_argument("-p", "--pixeldrain", action="store_true", help="Enable PixelDrain auto-upload")
+    parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
+    parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
-    parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="aria2c", help="Downloader engine (default: aria2c)")
-    parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download (default: 1)")
+    parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="aria2c", help="Downloader engine")
+    parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
     parser.add_argument("--audio-url", type=str, default=None, help="Manual Khmer audio URL override for the episode")
-    parser.add_argument("--manual-urls", type=str, default=None, help="JSON file mapping episode numbers to manual video URLs")
 
     args = parser.parse_args()
+    
+    pd_key = args.pixeldrain_key if (args.pixeldrain or args.pixeldrain_key) else None
+    gdrive_dir = Path(args.gdrive_dir) if args.gdrive_dir != "none" else None
+
     process_pipeline(
         start_ep=args.start,
         end_ep=args.end,
-        gdrive_dir=Path(args.gdrive_dir),
+        gdrive_dir=gdrive_dir,
+        pixeldrain_key=pd_key,
         work_dir=Path(args.work_dir),
         downloader=args.downloader,
         connections=args.connections,
         manual_video_url=args.video_url,
-        manual_audio_url=args.audio_url,
-        manual_urls_file=Path(args.manual_urls) if args.manual_urls else None
+        manual_audio_url=args.audio_url
     )
 
 if __name__ == "__main__":
