@@ -24,10 +24,16 @@ import urllib.parse
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
+try:
+    from curl_cffi import requests as cffi_requests
+    HAS_CURL_CFFI = True
+except ImportError:
+    HAS_CURL_CFFI = False
+
 SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"  # https://a.111477.xyz/
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 DEFAULT_AUDIO_DELAY = 1.0  # +1.0 second delay to match Netflix 1080p intro
 DEFAULT_PIXELDRAIN_KEY = "cafccc0b-66db-4f1d-a5bb-de45da49f9d5"
 
@@ -86,12 +92,22 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     backoff = 3
     for attempt in range(5):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": "https://st.111477.xyz/"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                streams = data.get("streams", [])
-                if streams:
-                    return streams[0].get("url")
+            if HAS_CURL_CFFI:
+                r = cffi_requests.get(url, impersonate="chrome", timeout=15, headers={"Referer": "https://st.111477.xyz/"})
+                if r.status_code == 200:
+                    data = r.json()
+                    streams = data.get("streams", [])
+                    if streams:
+                        return streams[0].get("url")
+                elif r.status_code == 429:
+                    raise urllib.error.HTTPError(url, 429, "Too Many Requests", r.headers, None)
+            else:
+                req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": "https://st.111477.xyz/"})
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                    streams = data.get("streams", [])
+                    if streams:
+                        return streams[0].get("url")
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 print(f"[-] Rate limited (429) resolving stream for E{ep_num:02d}. Backing off {backoff}s...", file=sys.stderr)
@@ -106,34 +122,34 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     return None
 
 def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video") -> bool:
-    """Robust native Python chunked stream downloader with live progress."""
+    """Robust chunked stream downloader with curl_cffi Chrome TLS impersonation & urllib fallback."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size >= min_size:
         return True
 
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Sec-Fetch-Dest": "video",
-        "Sec-Fetch-Mode": "no-cors",
-        "Sec-Fetch-Site": "cross-site",
-        "Referer": "https://st.111477.xyz/"
-    }
-
     backoff = 5
     for attempt in range(1, 8):
         try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                total_size = int(resp.headers.get("content-length", 0))
+            if HAS_CURL_CFFI:
+                r = cffi_requests.get(
+                    url,
+                    impersonate="chrome",
+                    stream=True,
+                    timeout=60,
+                    headers={"Referer": "https://st.111477.xyz/"}
+                )
+                if r.status_code == 429:
+                    raise urllib.error.HTTPError(url, 429, "Too Many Requests", r.headers, None)
+                if r.status_code != 200:
+                    raise Exception(f"HTTP {r.status_code}")
+
+                total_size = int(r.headers.get("content-length", 0))
                 bytes_downloaded = 0
                 start_time = time.time()
                 last_print = 0
 
                 with open(output_path, "wb") as out_f:
-                    while True:
-                        chunk = resp.read(256 * 1024)
+                    for chunk in r.iter_content(chunk_size=256 * 1024):
                         if not chunk:
                             break
                         out_f.write(chunk)
@@ -155,6 +171,47 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
                 print()
                 if output_path.exists() and output_path.stat().st_size >= min_size:
                     return True
+            else:
+                headers = {
+                    "User-Agent": USER_AGENT,
+                    "Accept": "*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Sec-Fetch-Dest": "video",
+                    "Sec-Fetch-Mode": "no-cors",
+                    "Sec-Fetch-Site": "cross-site",
+                    "Referer": "https://st.111477.xyz/"
+                }
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    total_size = int(resp.headers.get("content-length", 0))
+                    bytes_downloaded = 0
+                    start_time = time.time()
+                    last_print = 0
+
+                    with open(output_path, "wb") as out_f:
+                        while True:
+                            chunk = resp.read(256 * 1024)
+                            if not chunk:
+                                break
+                            out_f.write(chunk)
+                            bytes_downloaded += len(chunk)
+                            now = time.time()
+                            if now - last_print >= 0.5 and bytes_downloaded > 0:
+                                last_print = now
+                                elapsed = now - start_time
+                                speed = (bytes_downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                                if total_size > 0:
+                                    pct = (bytes_downloaded / total_size) * 100
+                                    mb_cur = bytes_downloaded / (1024 * 1024)
+                                    mb_tot = total_size / (1024 * 1024)
+                                    print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
+                                else:
+                                    mb_cur = bytes_downloaded / (1024 * 1024)
+                                    print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
+
+                    print()
+                    if output_path.exists() and output_path.stat().st_size >= min_size:
+                        return True
         except urllib.error.HTTPError as e:
             if e.code == 429:
                 print(f"\n    [!] HTTP 429 (Rate Limited). Backing off {backoff}s before retry {attempt}/7...", file=sys.stderr)
