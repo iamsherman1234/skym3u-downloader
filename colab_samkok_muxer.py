@@ -63,14 +63,20 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     return None
 
 def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> bool:
-    """Download single-stream via curl with auto-resume and browser headers."""
-    cmd = [
+    """Download single-stream via curl with clean error recovery and no Range header conflicts."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    # If 0-byte corrupted file exists, remove it
+    if output_path.exists() and output_path.stat().st_size == 0:
+        output_path.unlink()
+
+    has_partial = output_path.exists() and output_path.stat().st_size > 0
+
+    base_cmd = [
         "curl",
-        "-C", "-",
         "-L",
-        "--retry", "10",
+        "--retry", "5",
         "--retry-delay", "3",
-        "--retry-all-errors",
         "--connect-timeout", "20",
         "--speed-time", "30",
         "--speed-limit", "1000",
@@ -78,77 +84,25 @@ def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> 
         "-H", "Referer: https://st.111477.xyz/",
         "-H", "Origin: https://st.111477.xyz",
         "--progress-bar",
-        "-o", str(output_path),
-        url
+        "-o", str(output_path)
     ]
+
+    cmd = list(base_cmd)
+    if has_partial:
+        cmd.extend(["-C", "-"])
+    cmd.append(url)
+
     proc = subprocess.run(cmd)
+
+    # If curl failed (e.g. error 33 byte-range unsupported), remove file and retry fresh from offset 0
+    if proc.returncode != 0 or not (output_path.exists() and output_path.stat().st_size >= min_size):
+        if output_path.exists():
+            output_path.unlink()
+        print("    [!] Retrying fresh download from start...")
+        fresh_cmd = list(base_cmd) + [url]
+        proc = subprocess.run(fresh_cmd)
+
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
-
-def download_chunked_robust(url: str, output_path: Path, label: str = "File", min_size: int = 1000000, max_retries: int = 10) -> bool:
-    """Robust single-connection downloader with fallback to curl."""
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    
-    # Try single-connection curl first (handles Cloudflare tokens and range headers best)
-    print(f"    📥 Downloading [{label}] via single stream...")
-    if download_file_curl(url, output_path, min_size=min_size):
-        return True
-
-    print(f"    [!] Curl encountered issue, attempting Python single connection...")
-    block_size = 2 * 1024 * 1024  # 2 MB chunks
-
-    for attempt in range(max_retries):
-        downloaded = output_path.stat().st_size if output_path.exists() else 0
-        headers = {
-            "User-Agent": USER_AGENT,
-            "Referer": "https://st.111477.xyz/",
-            "Accept": "*/*"
-        }
-        if downloaded > 0:
-            headers["Range"] = f"bytes={downloaded}-"
-
-        req = urllib.request.Request(url, headers=headers)
-        start_time = time.time()
-        try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                status = getattr(resp, 'status', 200)
-                content_len = int(resp.headers.get("Content-Length", 0))
-                
-                if status == 206:
-                    total_size = downloaded + content_len
-                    mode = "ab"
-                else:
-                    total_size = content_len if content_len > 0 else None
-                    mode = "wb"
-                    downloaded = 0
-
-                last_print = time.time()
-                with open(output_path, mode) as f:
-                    while True:
-                        chunk = resp.read(block_size)
-                        if not chunk:
-                            break
-                        f.write(chunk)
-                        downloaded += len(chunk)
-                        now = time.time()
-                        if now - last_print > 4:
-                            elapsed = now - start_time
-                            speed_mb = (downloaded / (1024 * 1024)) / (elapsed + 1e-5)
-                            if total_size and total_size > 0:
-                                pct = (downloaded / total_size) * 100
-                                print(f"    ⏳ [{label}] {downloaded / (1024*1024):.1f} / {total_size / (1024*1024):.1f} MB ({pct:.1f}%) - {speed_mb:.2f} MB/s", end="\r")
-                            else:
-                                print(f"    ⏳ [{label}] {downloaded / (1024*1024):.1f} MB downloaded - {speed_mb:.2f} MB/s", end="\r")
-                            last_print = now
-
-            print(f"\n    [+] [{label}] Download finished ({downloaded / (1024*1024):.1f} MB).")
-            if output_path.exists() and output_path.stat().st_size >= min_size:
-                return True
-
-        except Exception as e:
-            print(f"\n    [!] Connection notice ({e}). Retrying ({attempt+1}/{max_retries})...")
-            time.sleep(3)
-
-    return output_path.exists() and output_path.stat().st_size >= min_size
 
 def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
     cmd = [
@@ -254,9 +208,9 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
         print(f"    [+] 1080p Stream URL ready.")
 
         print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
-        if not download_chunked_robust(video_stream_url, temp_raw_video, label=f"Video E{ep_num:02d}", min_size=50000000):
+        if not download_file_curl(video_stream_url, temp_raw_video, min_size=50000000):
             print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
-            print(f"    👉 TIP: If Cloudflare blocks automated download with 429, you can provide a direct link with --video-url \"<url>\".", file=sys.stderr)
+            print(f"    👉 TIP: If Cloudflare blocks automated download, provide direct link with --video-url \"<url>\".", file=sys.stderr)
             continue
 
         # 2. Download Khmer Audio Stream
@@ -267,7 +221,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Path, work_dir: Pat
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
-        if not download_chunked_robust(audio_stream_url, temp_audio_mp4, label=f"Khmer E{ep_num:02d}", min_size=10000000):
+        if not download_file_curl(audio_stream_url, temp_audio_mp4, min_size=10000000):
             print(f"[-] Audio download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
