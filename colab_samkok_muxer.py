@@ -108,10 +108,16 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
     headers = {
         "User-Agent": USER_AGENT,
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Sec-Fetch-Dest": "video",
+        "Sec-Fetch-Mode": "no-cors",
+        "Sec-Fetch-Site": "cross-site",
         "Referer": "https://st.111477.xyz/"
     }
 
-    for attempt in range(1, 6):
+    backoff = 5
+    for attempt in range(1, 8):
         try:
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -144,11 +150,21 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
                 print()
                 if output_path.exists() and output_path.stat().st_size >= min_size:
                     return True
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print(f"\n    [!] HTTP 429 (Rate Limited). Backing off {backoff}s before retry {attempt}/7...", file=sys.stderr)
+                time.sleep(backoff)
+                backoff = min(backoff + 10, 45)
+            else:
+                print(f"\n    [!] HTTP {e.code} error on attempt {attempt}: {e}. Retrying...", file=sys.stderr)
+                time.sleep(5)
+            if output_path.exists():
+                output_path.unlink()
         except Exception as e:
             print(f"\n    [!] Download attempt {attempt} error: {e}. Retrying...", file=sys.stderr)
             if output_path.exists():
                 output_path.unlink()
-            time.sleep(3)
+            time.sleep(5)
 
     return False
 
