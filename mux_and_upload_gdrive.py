@@ -56,8 +56,34 @@ def load_progress(state_file: Path) -> Dict[str, Any]:
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
+def load_netflix_streams_catalog() -> Dict[str, str]:
+    candidates = [
+        Path("netflix_samkok_1080p_streams.json"),
+        Path("/content/skym3u-downloader/netflix_samkok_1080p_streams.json"),
+        Path("/root/skym3u-downloader/netflix_samkok_1080p_streams.json")
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+    url = "https://raw.githubusercontent.com/iamsherman1234/skym3u-downloader/main/netflix_samkok_1080p_streams.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        pass
+    return {}
+
 def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
+    catalog = load_netflix_streams_catalog()
+    if str(ep_num) in catalog and catalog[str(ep_num)]:
+        return catalog[str(ep_num)]
+
     url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
+    backoff = 3
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": "https://st.111477.xyz/"})
@@ -66,9 +92,17 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
                 streams = data.get("streams", [])
                 if streams:
                     return streams[0].get("url")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print(f"[-] Rate limited (429) resolving stream for E{ep_num:02d}. Backing off {backoff}s...", file=sys.stderr)
+                time.sleep(backoff)
+                backoff = min(backoff + 5, 20)
+            else:
+                print(f"[-] HTTP {e.code} resolving stream for E{ep_num:02d} (attempt {attempt+1}): {e}", file=sys.stderr)
+                time.sleep(3)
         except Exception as e:
-            print(f"[-] Failed to resolve 1080p stream for E{ep_num:02d} (attempt {attempt+1}): {e}")
-            time.sleep(2)
+            print(f"[-] Failed to resolve 1080p stream for E{ep_num:02d} (attempt {attempt+1}): {e}", file=sys.stderr)
+            time.sleep(3)
     return None
 
 def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000) -> bool:

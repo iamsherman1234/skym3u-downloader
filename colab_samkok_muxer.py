@@ -50,8 +50,35 @@ def load_khmer_catalog() -> List[Dict[str, Any]]:
         print(f"[-] Error loading Khmer catalog: {e}", file=sys.stderr)
         return []
 
+def load_netflix_streams_catalog() -> Dict[str, str]:
+    candidates = [
+        Path("netflix_samkok_1080p_streams.json"),
+        Path("/content/skym3u-downloader/netflix_samkok_1080p_streams.json"),
+        Path("/root/skym3u-downloader/netflix_samkok_1080p_streams.json")
+    ]
+    for p in candidates:
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+    url = "https://raw.githubusercontent.com/iamsherman1234/skym3u-downloader/main/netflix_samkok_1080p_streams.json"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        pass
+    return {}
+
 def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
+    # Check pre-cached catalog first to avoid HTTP 429 rate limits
+    catalog = load_netflix_streams_catalog()
+    if str(ep_num) in catalog and catalog[str(ep_num)]:
+        return catalog[str(ep_num)]
+
     url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
+    backoff = 3
     for attempt in range(5):
         try:
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Referer": "https://st.111477.xyz/"})
@@ -60,9 +87,17 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
                 streams = data.get("streams", [])
                 if streams:
                     return streams[0].get("url")
+        except urllib.error.HTTPError as e:
+            if e.code == 429:
+                print(f"[-] Rate limited (429) resolving stream for E{ep_num:02d}. Backing off {backoff}s...", file=sys.stderr)
+                time.sleep(backoff)
+                backoff = min(backoff + 5, 20)
+            else:
+                print(f"[-] HTTP {e.code} resolving stream for E{ep_num:02d} (attempt {attempt+1}): {e}", file=sys.stderr)
+                time.sleep(3)
         except Exception as e:
-            print(f"[-] Attempt {attempt+1} failed to resolve 1080p stream for E{ep_num:02d}: {e}")
-            time.sleep(2)
+            print(f"[-] Attempt {attempt+1} failed to resolve stream for E{ep_num:02d}: {e}", file=sys.stderr)
+            time.sleep(3)
     return None
 
 def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_size: int = 1000000) -> bool:
@@ -78,8 +113,8 @@ def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_
         "-d", str(output_path.parent),
         "-o", output_path.name,
         "-U", USER_AGENT,
-        f"--header=Referer: https://st.111477.xyz/",
-        f"--header=Origin: https://st.111477.xyz",
+        "--header=Referer: https://st.111477.xyz/",
+        "--check-certificate=false",
         "--allow-overwrite=true",
         "--auto-file-renaming=false",
         "--summary-interval=5",
@@ -106,7 +141,6 @@ def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> 
         "--speed-limit", "1000",
         "-A", USER_AGENT,
         "-H", "Referer: https://st.111477.xyz/",
-        "-H", "Origin: https://st.111477.xyz",
         "--progress-bar",
         "-o", str(output_path)
     ]
@@ -131,7 +165,10 @@ def download_stream(url: str, output_path: Path, engine: str = "aria2c", connect
     if engine == "aria2c":
         res = subprocess.run(["which", "aria2c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode == 0:
-            return download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
+            ok = download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
+            if ok:
+                return True
+            print("    [!] aria2c download failed, falling back to curl...", file=sys.stderr)
     return download_file_curl(url, output_path, min_size=min_size)
 
 def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0, ep_num: int = 1) -> bool:
@@ -348,7 +385,7 @@ def main():
     parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
-    parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="aria2c", help="Downloader engine")
+    parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="curl", help="Downloader engine (default: curl)")
     parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download")
     parser.add_argument("--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
