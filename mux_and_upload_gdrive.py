@@ -83,17 +83,35 @@ def load_netflix_streams_catalog() -> Dict[str, str]:
         pass
     return {}
 
-def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
+def get_default_proxy(explicit_proxy: Optional[str] = None) -> Optional[str]:
+    """Auto-detects Cloudflare WARP proxy (127.0.0.1:40000) or environment proxies."""
+    if explicit_proxy and explicit_proxy.lower() != "none":
+        return explicit_proxy
+    env_proxy = os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("all_proxy") or os.environ.get("https_proxy")
+    if env_proxy:
+        return env_proxy
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
+            if s.connect_ex(("127.0.0.1", 40000)) == 0:
+                return "socks5://127.0.0.1:40000"
+    except Exception:
+        pass
+    return None
+
+def resolve_1080p_stream_url(ep_num: int, proxy: Optional[str] = None) -> Optional[str]:
     catalog = load_netflix_streams_catalog()
     if str(ep_num) in catalog and catalog[str(ep_num)]:
         return catalog[str(ep_num)]
 
+    active_proxy = get_default_proxy(proxy)
     url = f"{STREMIO_BASE}/config/{A11_BASE_B64}/stream/series/{SERIES_IMDB_ID}:1:{ep_num}.json"
     backoff = 3
     for attempt in range(5):
         try:
             if HAS_CURL_CFFI:
-                r = cffi_requests.get(url, impersonate="chrome", timeout=15, headers={"Referer": "https://st.111477.xyz/"})
+                r = cffi_requests.get(url, impersonate="chrome", timeout=15, headers={"Referer": "https://st.111477.xyz/"}, proxy=active_proxy)
                 if r.status_code == 200:
                     data = r.json()
                     streams = data.get("streams", [])
@@ -121,12 +139,13 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(3)
     return None
 
-def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0) -> bool:
+def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0, proxy: Optional[str] = None) -> bool:
     """True HTTP Range Resumable Downloader with Chrome TLS impersonation, bandwidth pacing, and zero-loss retries."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size >= min_size:
         return True
 
+    active_proxy = get_default_proxy(proxy)
     backoff = 8
     max_retries = 15
     total_size = 0
@@ -154,7 +173,8 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
                     headers=headers,
                     impersonate="chrome",
                     stream=True,
-                    timeout=60
+                    timeout=60,
+                    proxy=active_proxy
                 )
                 if r.status_code == 429:
                     raise urllib.error.HTTPError(url, 429, "Too Many Requests", r.headers, None)
@@ -266,7 +286,7 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
     return output_path.exists() and output_path.stat().st_size >= min_size
 
-def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000, desc: str = "1080p Video", max_speed_mb: float = 10.0) -> bool:
+def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000, desc: str = "1080p Video", max_speed_mb: float = 10.0, proxy: Optional[str] = None) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
@@ -285,14 +305,18 @@ def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000
         url
     ]
 
+    active_proxy = get_default_proxy(proxy)
+    if active_proxy:
+        base_cmd.extend(["--proxy", active_proxy])
+
     proc = subprocess.run(base_cmd)
     if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size:
         return True
 
     print("    [!] curl failed or range unsupported, falling back to python stream downloader...", file=sys.stderr)
-    return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb)
+    return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb, proxy=active_proxy)
 
-def download_audio_mp4(url: str, output_path: Path) -> bool:
+def download_audio_mp4(url: str, output_path: Path, proxy: Optional[str] = None) -> bool:
     if output_path.exists() and output_path.stat().st_size > 10000000:
         return True
     try:
@@ -314,7 +338,7 @@ def download_audio_mp4(url: str, output_path: Path) -> bool:
     except FileNotFoundError:
         pass
 
-    return download_file_resilient(url, output_path, min_size=10000000, desc="Khmer Audio")
+    return download_file_resilient(url, output_path, min_size=10000000, desc="Khmer Audio", proxy=proxy)
 
 def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0, ep_num: int = 1) -> bool:
     """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for 100% Netflix lip-sync."""
@@ -406,7 +430,7 @@ def upload_to_rclone(local_file: Path, remote_dest: str) -> bool:
     proc = subprocess.run(cmd)
     return proc.returncode == 0
 
-def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, audio_delay: float = 1.0, video_url: Optional[str] = None, force: bool = False, max_speed_mb: float = 10.0):
+def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, audio_delay: float = 1.0, video_url: Optional[str] = None, force: bool = False, max_speed_mb: float = 10.0, proxy: Optional[str] = None):
     catalog = load_khmer_catalog()
     if not catalog:
         return
@@ -416,12 +440,16 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
     links_file = work_dir / "pixeldrain_links.txt"
     progress = load_progress(state_file)
 
+    active_proxy = get_default_proxy(proxy)
+
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Automated Pipeline (Episodes {start_ep} to {end_ep})")
     print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Hardware Physical Padding)")
     print(f"🚀 Speed Limit: {max_speed_mb:.1f} MB/s (Anti-Throttling Protection)")
+    if active_proxy:
+        print(f"🛡️  Proxy / WARP: {active_proxy}")
     if pixeldrain_key:
         print(f"⚡ PixelDrain Auto-Upload: ENABLED")
     if remote_dest:
@@ -458,7 +486,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
         stream_link = video_url if (video_url and ep_num == start_ep) else None
         if not stream_link:
             print(f"[1/4] 🔍 Resolving 1080p stream link via st.111477.xyz...")
-            stream_link = resolve_1080p_stream_url(ep_num)
+            stream_link = resolve_1080p_stream_url(ep_num, proxy=active_proxy)
         else:
             print(f"[1/4] 🔗 Using manual video stream URL.")
 
@@ -469,7 +497,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
         time.sleep(2)  # Cooldown pause for stream handshake
 
         print(f"    📥 Downloading 1080p video file (~2.4 GB)...")
-        if not download_file_resilient(stream_link, temp_raw_video, min_size=50000000, max_speed_mb=max_speed_mb):
+        if not download_file_resilient(stream_link, temp_raw_video, min_size=50000000, max_speed_mb=max_speed_mb, proxy=active_proxy):
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
@@ -482,7 +510,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
             continue
 
         print(f"    📥 Downloading Khmer MP4 stream (~300 MB)...")
-        if not download_audio_mp4(audio_stream_url, temp_audio_mp4):
+        if not download_audio_mp4(audio_stream_url, temp_audio_mp4, proxy=active_proxy):
             print(f"[-] Audio stream download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
@@ -556,6 +584,7 @@ def main():
     parser.add_argument("-d", "--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
     parser.add_argument("-f", "--force", action="store_true", help="Force re-download and re-mux even if previously marked completed")
     parser.add_argument("--max-speed", type=float, default=10.0, help="Maximum download speed in MB/s to prevent Cloudflare burst limits (default: 10.0)")
+    parser.add_argument("--proxy", type=str, default=None, help="Proxy URL (e.g. 'socks5://127.0.0.1:40000' for Cloudflare WARP)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for start episode")
 
     args = parser.parse_args()
@@ -571,7 +600,8 @@ def main():
         audio_delay=args.delay,
         video_url=args.video_url,
         force=args.force,
-        max_speed_mb=args.max_speed
+        max_speed_mb=args.max_speed,
+        proxy=args.proxy
     )
 
 if __name__ == "__main__":
