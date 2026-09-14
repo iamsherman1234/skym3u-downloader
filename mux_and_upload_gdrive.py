@@ -125,7 +125,7 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
     for attempt in range(1, 8):
         try:
             req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=60) as resp:
                 total_size = int(resp.headers.get("content-length", 0))
                 bytes_downloaded = 0
                 start_time = time.time()
@@ -133,13 +133,13 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
                 with open(output_path, "wb") as out_f:
                     while True:
-                        chunk = resp.read(1024 * 1024 * 2)
+                        chunk = resp.read(256 * 1024)
                         if not chunk:
                             break
                         out_f.write(chunk)
                         bytes_downloaded += len(chunk)
                         now = time.time()
-                        if now - last_print >= 0.5:
+                        if now - last_print >= 0.5 and bytes_downloaded > 0:
                             last_print = now
                             elapsed = now - start_time
                             speed = (bytes_downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
@@ -371,6 +371,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
             print(f"[-] Could not resolve 1080p video URL for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
         print(f"    [+] 1080p Stream URL resolved.")
+        time.sleep(2)  # Cooldown pause for stream handshake
 
         print(f"    📥 Downloading 1080p video file (~2.4 GB)...")
         if not download_file_resilient(stream_link, temp_raw_video, min_size=50000000):
