@@ -27,7 +27,7 @@ SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"  # https://a.111477.xyz/
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-AUDIO_SYNC_OFFSET = "0.940"  # Seconds to trim from Khmer audio for Netflix 1080p alignment
+DEFAULT_AUDIO_OFFSET = 0.0  # Perfect 1:1 sync between TheKomsan & Netflix 1080p
 DEFAULT_PIXELDRAIN_KEY = "cafccc0b-66db-4f1d-a5bb-de45da49f9d5"
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
@@ -71,7 +71,6 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
     return None
 
 def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000) -> bool:
-    """Downloads a file using curl with auto-resume, retries, and rate recovery."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size == 0:
         output_path.unlink()
@@ -100,7 +99,6 @@ def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000
 
     proc = subprocess.run(cmd)
 
-    # Fallback retry without -C - if range error occurs
     if proc.returncode != 0 or not (output_path.exists() and output_path.stat().st_size >= min_size):
         if output_path.exists():
             output_path.unlink()
@@ -111,11 +109,8 @@ def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
 def download_audio_mp4(url: str, output_path: Path) -> bool:
-    """Downloads TheKomsan MP4 via aria2c or curl."""
     if output_path.exists() and output_path.stat().st_size > 10000000:
         return True
-    
-    # Try aria2c first
     try:
         cmd = [
             "aria2c",
@@ -147,11 +142,16 @@ def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc.returncode == 0 and output_aac.exists() and output_aac.stat().st_size > 500000
 
-def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(video_path),
-        "-ss", AUDIO_SYNC_OFFSET,
+def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int, audio_offset: float = 0.0) -> bool:
+    cmd = ["ffmpeg", "-y", "-i", str(video_path)]
+    
+    if abs(audio_offset) > 0.001:
+        if audio_offset > 0:
+            cmd.extend(["-itsoffset", f"{audio_offset:.3f}"])
+        else:
+            cmd.extend(["-ss", f"{abs(audio_offset):.3f}"])
+
+    cmd.extend([
         "-i", str(audio_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -169,12 +169,11 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
         "-metadata", f"title=Three Kingdoms (2010) - Episode {ep_num:02d} [1080p Khmer Dubbed]",
         "-t", "2618",
         str(output_mkv)
-    ]
+    ])
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 10000000
 
 def upload_to_pixeldrain(local_file: Path, api_key: str) -> Optional[str]:
-    """Uploads file directly to PixelDrain using API key and returns direct link."""
     print(f"[*] ⚡ Uploading '{local_file.name}' ({local_file.stat().st_size / (1024*1024):.1f} MB) to PixelDrain...")
     url = f"https://pixeldrain.com/api/file/{urllib.parse.quote(local_file.name)}"
     cmd = [
@@ -205,7 +204,7 @@ def upload_to_rclone(local_file: Path, remote_dest: str) -> bool:
     proc = subprocess.run(cmd)
     return proc.returncode == 0
 
-def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, video_url: Optional[str] = None):
+def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, audio_offset: float = 0.0, video_url: Optional[str] = None):
     catalog = load_khmer_catalog()
     if not catalog:
         return
@@ -219,7 +218,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
     print(f"🎬 Starting Samkok 1080p Automated Pipeline (Episodes {start_ep} to {end_ep})")
     print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
-    print(f"⏱️  Audio Sync Offset: -ss {AUDIO_SYNC_OFFSET}s (Verified)")
+    print(f"⏱️  Audio Sync Offset: {audio_offset:+.3f}s (Direct 1:1)")
     if pixeldrain_key:
         print(f"⚡ PixelDrain Auto-Upload: ENABLED")
     if remote_dest:
@@ -276,7 +275,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
 
         # 3. Losslessly Remux 1080p Video + Khmer Audio + Mandarin + Subtitles
         print(f"[3/4] ⚡ Losslessly remuxing into 1080p Dual-Audio MKV...")
-        mux_ok = remux_local_streams(temp_raw_video, temp_khmer_aac, final_mkv, ep_num)
+        mux_ok = remux_local_streams(temp_raw_video, temp_khmer_aac, final_mkv, ep_num, audio_offset=audio_offset)
         if temp_raw_video.exists(): temp_raw_video.unlink()
         if temp_khmer_aac.exists(): temp_khmer_aac.unlink()
 
@@ -293,7 +292,6 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
             pd_link = upload_to_pixeldrain(final_mkv, pixeldrain_key)
             if pd_link:
                 progress.setdefault("pixeldrain_links", {})[str(ep_num)] = pd_link
-                # Append to text file
                 with open(links_file, "a", encoding="utf-8") as lf:
                     lf.write(f"Episode {ep_num:02d}: {pd_link}\n")
 
@@ -336,11 +334,11 @@ def main():
     parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-r", "--remote", type=str, default="none", help="Rclone remote destination (default: none)")
     parser.add_argument("-w", "--work-dir", type=str, default="./samkok_work", help="Working directory")
+    parser.add_argument("-o", "--audio-offset", type=float, default=DEFAULT_AUDIO_OFFSET, help="Audio sync offset in seconds (default: 0.0)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for start episode")
 
     args = parser.parse_args()
     
-    # Enable pixeldrain key if flag is set or key explicitly given
     pd_key = args.pixeldrain_key if (args.pixeldrain or args.pixeldrain_key) else None
 
     process_pipeline(
@@ -349,6 +347,7 @@ def main():
         remote_dest=args.remote if args.remote != "none" else None,
         pixeldrain_key=pd_key,
         work_dir=Path(args.work_dir),
+        audio_offset=args.audio_offset,
         video_url=args.video_url
     )
 
