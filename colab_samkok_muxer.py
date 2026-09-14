@@ -343,8 +343,9 @@ def main():
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
-    parser.add_argument("-p", "--pixeldrain", action="store_true", help="Enable PixelDrain auto-upload")
-    parser.add_argument("--pixeldrain-key", type=str, default=None, help="PixelDrain API key")
+    parser.add_argument("-p", "--pixeldrain", action="store_true", default=True, help="Enable PixelDrain auto-upload (default: True)")
+    parser.add_argument("--no-pixeldrain", dest="pixeldrain", action="store_false", help="Disable PixelDrain auto-upload")
+    parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
     parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="aria2c", help="Downloader engine")
@@ -355,7 +356,7 @@ def main():
 
     args = parser.parse_args()
     
-    pd_key = args.pixeldrain_key or (DEFAULT_PIXELDRAIN_KEY if args.pixeldrain else None)
+    pd_key = args.pixeldrain_key if args.pixeldrain else None
     gdrive_dir = Path(args.gdrive_dir) if args.gdrive_dir != "none" else None
 
     process_pipeline(

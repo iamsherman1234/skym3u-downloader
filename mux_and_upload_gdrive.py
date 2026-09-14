@@ -350,8 +350,9 @@ def main():
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
-    parser.add_argument("-p", "--pixeldrain", action="store_true", help="Enable PixelDrain auto-upload with default key")
-    parser.add_argument("--pixeldrain-key", type=str, default=None, help="Custom PixelDrain API key")
+    parser.add_argument("-p", "--pixeldrain", action="store_true", default=True, help="Enable PixelDrain auto-upload (default: True)")
+    parser.add_argument("--no-pixeldrain", dest="pixeldrain", action="store_false", help="Disable PixelDrain auto-upload")
+    parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-r", "--remote", type=str, default="none", help="Rclone remote destination (default: none)")
     parser.add_argument("-w", "--work-dir", type=str, default="./samkok_work", help="Working directory")
     parser.add_argument("-d", "--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
@@ -359,7 +360,7 @@ def main():
 
     args = parser.parse_args()
     
-    pd_key = args.pixeldrain_key or (DEFAULT_PIXELDRAIN_KEY if args.pixeldrain else None)
+    pd_key = args.pixeldrain_key if args.pixeldrain else None
 
     process_pipeline(
         start_ep=args.start,
