@@ -144,7 +144,7 @@ def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
         "-vn", "-c:a", "copy",
         str(output_aac)
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc.returncode == 0 and output_aac.exists() and output_aac.stat().st_size > 500000
 
 def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
@@ -170,7 +170,7 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
         "-t", "2618",
         str(output_mkv)
     ]
-    proc = subprocess.run(cmd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 10000000
 
 def upload_to_pixeldrain(local_file: Path, api_key: str) -> Optional[str]:
