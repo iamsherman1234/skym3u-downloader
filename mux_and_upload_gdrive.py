@@ -105,12 +105,62 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(3)
     return None
 
-def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000) -> bool:
+def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video") -> bool:
+    """Robust native Python chunked stream downloader with live progress."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists() and output_path.stat().st_size == 0:
-        output_path.unlink()
+    if output_path.exists() and output_path.stat().st_size >= min_size:
+        return True
 
-    has_partial = output_path.exists() and output_path.stat().st_size > 0
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://st.111477.xyz/"
+    }
+
+    for attempt in range(1, 6):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total_size = int(resp.headers.get("content-length", 0))
+                bytes_downloaded = 0
+                start_time = time.time()
+                last_print = 0
+
+                with open(output_path, "wb") as out_f:
+                    while True:
+                        chunk = resp.read(1024 * 1024 * 2)
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+                        bytes_downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_print >= 0.5:
+                            last_print = now
+                            elapsed = now - start_time
+                            speed = (bytes_downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                            if total_size > 0:
+                                pct = (bytes_downloaded / total_size) * 100
+                                mb_cur = bytes_downloaded / (1024 * 1024)
+                                mb_tot = total_size / (1024 * 1024)
+                                print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
+                            else:
+                                mb_cur = bytes_downloaded / (1024 * 1024)
+                                print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
+
+                print()
+                if output_path.exists() and output_path.stat().st_size >= min_size:
+                    return True
+        except Exception as e:
+            print(f"\n    [!] Python stream download attempt {attempt} error: {e}", file=sys.stderr)
+            if output_path.exists():
+                output_path.unlink()
+            time.sleep(3)
+
+    return False
+
+def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000, desc: str = "1080p Video") -> bool:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists():
+        output_path.unlink()
 
     base_cmd = [
         "curl",
@@ -118,30 +168,19 @@ def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000
         "--retry", "5",
         "--retry-delay", "3",
         "--connect-timeout", "20",
-        "--speed-time", "30",
-        "--speed-limit", "1000",
         "-A", USER_AGENT,
         "-H", "Referer: https://st.111477.xyz/",
-        "-H", "Origin: https://st.111477.xyz",
         "--progress-bar",
-        "-o", str(output_path)
+        "-o", str(output_path),
+        url
     ]
 
-    cmd = list(base_cmd)
-    if has_partial:
-        cmd.extend(["-C", "-"])
-    cmd.append(url)
+    proc = subprocess.run(base_cmd)
+    if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size:
+        return True
 
-    proc = subprocess.run(cmd)
-
-    if proc.returncode != 0 or not (output_path.exists() and output_path.stat().st_size >= min_size):
-        if output_path.exists():
-            output_path.unlink()
-        print("    [!] Retrying fresh download...")
-        fresh_cmd = list(base_cmd) + [url]
-        proc = subprocess.run(fresh_cmd)
-
-    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
+    print("    [!] curl failed or range unsupported, falling back to python stream downloader...", file=sys.stderr)
+    return download_file_python(url, output_path, min_size=min_size, desc=desc)
 
 def download_audio_mp4(url: str, output_path: Path) -> bool:
     if output_path.exists() and output_path.stat().st_size > 10000000:
@@ -165,7 +204,7 @@ def download_audio_mp4(url: str, output_path: Path) -> bool:
     except FileNotFoundError:
         pass
 
-    return download_file_resilient(url, output_path, min_size=10000000)
+    return download_file_resilient(url, output_path, min_size=10000000, desc="Khmer Audio")
 
 def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0, ep_num: int = 1) -> bool:
     """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for 100% Netflix lip-sync."""

@@ -100,6 +100,58 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(3)
     return None
 
+def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video") -> bool:
+    """Robust native Python chunked stream downloader with live progress and auto-retry."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and output_path.stat().st_size >= min_size:
+        return True
+
+    headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://st.111477.xyz/"
+    }
+
+    for attempt in range(1, 6):
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                total_size = int(resp.headers.get("content-length", 0))
+                bytes_downloaded = 0
+                start_time = time.time()
+                last_print = 0
+
+                with open(output_path, "wb") as out_f:
+                    while True:
+                        chunk = resp.read(1024 * 1024 * 2)  # 2MB chunks
+                        if not chunk:
+                            break
+                        out_f.write(chunk)
+                        bytes_downloaded += len(chunk)
+                        now = time.time()
+                        if now - last_print >= 0.5:
+                            last_print = now
+                            elapsed = now - start_time
+                            speed = (bytes_downloaded / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                            if total_size > 0:
+                                pct = (bytes_downloaded / total_size) * 100
+                                mb_cur = bytes_downloaded / (1024 * 1024)
+                                mb_tot = total_size / (1024 * 1024)
+                                print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
+                            else:
+                                mb_cur = bytes_downloaded / (1024 * 1024)
+                                print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
+
+                print()
+                if output_path.exists() and output_path.stat().st_size >= min_size:
+                    return True
+        except Exception as e:
+            print(f"\n    [!] Download attempt {attempt} error: {e}. Retrying...", file=sys.stderr)
+            if output_path.exists():
+                output_path.unlink()
+            time.sleep(3)
+
+    return False
+
 def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_size: int = 1000000) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size == 0:
@@ -127,49 +179,42 @@ def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_
 
 def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists() and output_path.stat().st_size == 0:
+    if output_path.exists():
         output_path.unlink()
 
-    has_partial = output_path.exists() and output_path.stat().st_size > 0
     base_cmd = [
         "curl",
         "-L",
         "--retry", "5",
         "--retry-delay", "3",
         "--connect-timeout", "20",
-        "--speed-time", "30",
-        "--speed-limit", "1000",
         "-A", USER_AGENT,
         "-H", "Referer: https://st.111477.xyz/",
         "--progress-bar",
-        "-o", str(output_path)
+        "-o", str(output_path),
+        url
     ]
 
-    cmd = list(base_cmd)
-    if has_partial:
-        cmd.extend(["-C", "-"])
-    cmd.append(url)
-
-    proc = subprocess.run(cmd)
-
-    if proc.returncode != 0 or not (output_path.exists() and output_path.stat().st_size >= min_size):
-        if output_path.exists():
-            output_path.unlink()
-        print("    [!] Retrying fresh download...")
-        fresh_cmd = list(base_cmd) + [url]
-        proc = subprocess.run(fresh_cmd)
-
+    proc = subprocess.run(base_cmd)
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
-def download_stream(url: str, output_path: Path, engine: str = "aria2c", connections: int = 1, min_size: int = 1000000) -> bool:
-    if engine == "aria2c":
+def download_stream(url: str, output_path: Path, engine: str = "python", connections: int = 1, min_size: int = 1000000, desc: str = "Video") -> bool:
+    if engine == "python":
+        return download_file_python(url, output_path, min_size=min_size, desc=desc)
+    elif engine == "curl":
+        ok = download_file_curl(url, output_path, min_size=min_size)
+        if ok:
+            return True
+        print("    [!] curl failed, falling back to python stream downloader...", file=sys.stderr)
+        return download_file_python(url, output_path, min_size=min_size, desc=desc)
+    elif engine == "aria2c":
         res = subprocess.run(["which", "aria2c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode == 0:
             ok = download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
             if ok:
                 return True
-            print("    [!] aria2c download failed, falling back to curl...", file=sys.stderr)
-    return download_file_curl(url, output_path, min_size=min_size)
+            print("    [!] aria2c failed, falling back to python stream downloader...", file=sys.stderr)
+    return download_file_python(url, output_path, min_size=min_size, desc=desc)
 
 def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0, ep_num: int = 1) -> bool:
     """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for 100% Netflix lip-sync."""
@@ -320,7 +365,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
         print(f"    [+] 1080p Stream URL ready.")
 
         print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
-        if not download_stream(video_stream_url, temp_raw_video, engine=downloader, connections=connections, min_size=50000000):
+        if not download_stream(video_stream_url, temp_raw_video, engine=downloader, connections=connections, min_size=50000000, desc="1080p Video"):
             print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
             continue
 
@@ -332,7 +377,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
-        if not download_stream(audio_stream_url, temp_audio_mp4, engine=downloader, connections=min(connections, 4), min_size=10000000):
+        if not download_stream(audio_stream_url, temp_audio_mp4, engine=downloader, connections=min(connections, 4), min_size=10000000, desc="Khmer Audio"):
             print(f"[-] Audio download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
@@ -385,7 +430,7 @@ def main():
     parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
-    parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="curl", help="Downloader engine (default: curl)")
+    parser.add_argument("-d", "--downloader", type=str, choices=["python", "curl", "aria2c"], default="python", help="Downloader engine (default: python)")
     parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download")
     parser.add_argument("--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
