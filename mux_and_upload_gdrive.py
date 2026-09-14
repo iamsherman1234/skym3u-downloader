@@ -84,20 +84,8 @@ def load_netflix_streams_catalog() -> Dict[str, str]:
     return {}
 
 def get_default_proxy(explicit_proxy: Optional[str] = None) -> Optional[str]:
-    """Auto-detects Cloudflare WARP proxy (127.0.0.1:40000) or environment proxies."""
     if explicit_proxy and explicit_proxy.lower() != "none":
         return explicit_proxy
-    env_proxy = os.environ.get("ALL_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("HTTP_PROXY") or os.environ.get("all_proxy") or os.environ.get("https_proxy")
-    if env_proxy:
-        return env_proxy
-    try:
-        import socket
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.2)
-            if s.connect_ex(("127.0.0.1", 40000)) == 0:
-                return "socks5://127.0.0.1:40000"
-    except Exception:
-        pass
     return None
 
 def resolve_1080p_stream_url(ep_num: int, proxy: Optional[str] = None) -> Optional[str]:
