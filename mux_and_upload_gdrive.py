@@ -140,150 +140,117 @@ def resolve_1080p_stream_url(ep_num: int, proxy: Optional[str] = None) -> Option
     return None
 
 def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0, proxy: Optional[str] = None) -> bool:
-    """True HTTP Range Resumable Downloader with Chrome TLS impersonation, bandwidth pacing, and zero-loss retries."""
+    """Bounded Slice-Range Resumable Downloader for Cloudflare Workers & CDNs."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    if output_path.exists() and output_path.stat().st_size >= min_size:
-        return True
-
     active_proxy = get_default_proxy(proxy)
-    backoff = 8
-    max_retries = 15
+    
+    # 1. Probe total file size with a 1-byte range request
     total_size = 0
-
-    for attempt in range(1, max_retries + 1):
-        current_size = output_path.stat().st_size if output_path.exists() else 0
-        if total_size > 0 and current_size >= total_size:
+    probe_headers = {
+        "User-Agent": USER_AGENT,
+        "Referer": "https://st.111477.xyz/",
+        "Range": "bytes=0-0"
+    }
+    for _ in range(5):
+        try:
+            if HAS_CURL_CFFI:
+                r = cffi_requests.get(url, headers=probe_headers, impersonate="chrome", timeout=15, proxy=active_proxy)
+                cr = r.headers.get("content-range") or r.headers.get("Content-Range")
+            else:
+                req = urllib.request.Request(url, headers=probe_headers)
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    cr = resp.headers.get("content-range") or resp.headers.get("Content-Range")
+            
+            if cr and "/" in cr:
+                total_size = int(cr.split("/")[-1])
+                break
+        except Exception:
+            time.sleep(1)
+            
+    if output_path.exists():
+        if total_size > 0 and output_path.stat().st_size >= total_size:
+            return True
+        if total_size == 0 and output_path.stat().st_size >= min_size:
             return True
 
-        try:
-            headers = {
-                "User-Agent": USER_AGENT,
-                "Referer": "https://st.111477.xyz/",
-                "Accept": "*/*",
-                "Sec-Fetch-Dest": "video",
-                "Sec-Fetch-Mode": "no-cors",
-                "Sec-Fetch-Site": "cross-site",
-            }
-            if current_size > 0:
-                headers["Range"] = f"bytes={current_size}-"
+    # 2. Slice-based chunk downloading (10 MB per request to keep worker execution within free limits)
+    SLICE_SIZE = 10 * 1024 * 1024
+    current_size = output_path.stat().st_size if output_path.exists() else 0
+    start_time = time.time()
 
-            if HAS_CURL_CFFI:
-                r = cffi_requests.get(
-                    url,
-                    headers=headers,
-                    impersonate="chrome",
-                    stream=True,
-                    timeout=60,
-                    proxy=active_proxy
-                )
-                if r.status_code == 429:
-                    raise urllib.error.HTTPError(url, 429, "Too Many Requests", r.headers, None)
-                if r.status_code not in (200, 206):
-                    raise Exception(f"HTTP {r.status_code}")
+    while total_size == 0 or current_size < total_size:
+        start_byte = current_size
+        end_byte = min(start_byte + SLICE_SIZE - 1, total_size - 1) if total_size > 0 else start_byte + SLICE_SIZE - 1
+        
+        slice_downloaded = False
+        backoff = 5
+        for attempt in range(1, 12):
+            try:
+                headers = {
+                    "User-Agent": USER_AGENT,
+                    "Referer": "https://st.111477.xyz/",
+                    "Range": f"bytes={start_byte}-{end_byte}",
+                    "Accept": "*/*",
+                }
+                slice_start = time.time()
+                if HAS_CURL_CFFI:
+                    r = cffi_requests.get(url, headers=headers, impersonate="chrome", timeout=45, proxy=active_proxy)
+                    if r.status_code == 429:
+                        raise urllib.error.HTTPError(url, 429, "Too Many Requests", r.headers, None)
+                    if r.status_code not in (200, 206):
+                        raise Exception(f"HTTP {r.status_code}")
+                    content = r.content
+                else:
+                    req = urllib.request.Request(url, headers=headers)
+                    with urllib.request.urlopen(req, timeout=45) as resp:
+                        content = resp.read()
 
-                # Determine total file size
-                cr = r.headers.get("content-range")
-                if cr and "/" in cr:
-                    try:
-                        total_size = int(cr.split("/")[-1])
-                    except Exception:
-                        pass
-                if total_size == 0:
-                    cl = int(r.headers.get("content-length", 0))
-                    total_size = current_size + cl if r.status_code == 206 else cl
+                if not content:
+                    raise Exception("Empty slice received")
 
-                open_mode = "ab" if (current_size > 0 and r.status_code == 206) else "wb"
-                bytes_downloaded = current_size
-                start_time = time.time()
-                last_print = 0
+                with open(output_path, "ab") as f:
+                    f.write(content)
 
-                with open(output_path, open_mode) as out_f:
-                    for chunk in r.iter_content(chunk_size=512 * 1024):
-                        chunk_start = time.time()
-                        if not chunk:
-                            break
-                        out_f.write(chunk)
-                        bytes_downloaded += len(chunk)
+                current_size = output_path.stat().st_size
 
-                        # Pacing
-                        if max_speed_mb > 0:
-                            target_time = len(chunk) / (max_speed_mb * 1024 * 1024)
-                            chunk_elapsed = time.time() - chunk_start
-                            if chunk_elapsed < target_time:
-                                time.sleep(target_time - chunk_elapsed)
+                # Speed pacing
+                if max_speed_mb > 0:
+                    target_time = len(content) / (max_speed_mb * 1024 * 1024)
+                    slice_elapsed = time.time() - slice_start
+                    if slice_elapsed < target_time:
+                        time.sleep(target_time - slice_elapsed)
 
-                        now = time.time()
-                        if now - last_print >= 0.5:
-                            last_print = now
-                            elapsed = now - start_time
-                            speed = ((bytes_downloaded - current_size) / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                            mb_cur = bytes_downloaded / (1024 * 1024)
-                            if total_size > 0:
-                                pct = (bytes_downloaded / total_size) * 100
-                                mb_tot = total_size / (1024 * 1024)
-                                print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
-                            else:
-                                print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
+                # Progress printing
+                elapsed = time.time() - start_time
+                speed = (current_size / (1024 * 1024)) / elapsed if elapsed > 0 else 0
+                mb_cur = current_size / (1024 * 1024)
+                if total_size > 0:
+                    pct = (current_size / total_size) * 100
+                    mb_tot = total_size / (1024 * 1024)
+                    print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
+                else:
+                    print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
 
-                print()
-                if output_path.exists() and output_path.stat().st_size >= min_size:
-                    return True
-            else:
-                req = urllib.request.Request(url, headers=headers)
-                with urllib.request.urlopen(req, timeout=60) as resp:
-                    cl = int(resp.headers.get("content-length", 0))
-                    total_size = current_size + cl if resp.status == 206 else cl
-                    open_mode = "ab" if (current_size > 0 and resp.status == 206) else "wb"
-                    bytes_downloaded = current_size
-                    start_time = time.time()
-                    last_print = 0
+                slice_downloaded = True
+                break
 
-                    with open(output_path, open_mode) as out_f:
-                        while True:
-                            chunk_start = time.time()
-                            chunk = resp.read(512 * 1024)
-                            if not chunk:
-                                break
-                            out_f.write(chunk)
-                            bytes_downloaded += len(chunk)
+            except urllib.error.HTTPError as e:
+                if e.code == 429:
+                    print(f"\n    [!] HTTP 429 on slice {start_byte // (1024*1024)}MB. Backing off {backoff}s...", file=sys.stderr)
+                    time.sleep(backoff)
+                    backoff = min(backoff + 5, 30)
+                else:
+                    print(f"\n    [!] HTTP {e.code} on slice. Retrying in 4s...", file=sys.stderr)
+                    time.sleep(4)
+            except Exception as e:
+                print(f"\n    [!] Slice error: {e}. Retrying in 4s...", file=sys.stderr)
+                time.sleep(4)
 
-                            # Pacing
-                            if max_speed_mb > 0:
-                                target_time = len(chunk) / (max_speed_mb * 1024 * 1024)
-                                chunk_elapsed = time.time() - chunk_start
-                                if chunk_elapsed < target_time:
-                                    time.sleep(target_time - chunk_elapsed)
+        if not slice_downloaded:
+            print(f"\n[-] Failed to download slice after retries.", file=sys.stderr)
+            break
 
-                            now = time.time()
-                            if now - last_print >= 0.5:
-                                last_print = now
-                                elapsed = now - start_time
-                                speed = ((bytes_downloaded - current_size) / (1024 * 1024)) / elapsed if elapsed > 0 else 0
-                                mb_cur = bytes_downloaded / (1024 * 1024)
-                                if total_size > 0:
-                                    pct = (bytes_downloaded / total_size) * 100
-                                    mb_tot = total_size / (1024 * 1024)
-                                    print(f"\r    📥 [{desc}] {pct:5.1f}% ({mb_cur:.1f}/{mb_tot:.1f} MB) at {speed:.2f} MB/s", end="", flush=True)
-                                else:
-                                    print(f"\r    📥 [{desc}] {mb_cur:.1f} MB at {speed:.2f} MB/s", end="", flush=True)
-
-                    print()
-                    if output_path.exists() and output_path.stat().st_size >= min_size:
-                        return True
-        except urllib.error.HTTPError as e:
-            cur_mb = (output_path.stat().st_size / (1024 * 1024)) if output_path.exists() else 0
-            if e.code == 429:
-                print(f"\n    [!] HTTP 429 (Rate Limited). Saved {cur_mb:.1f} MB. Backing off {backoff}s before resuming (attempt {attempt}/{max_retries})...", file=sys.stderr)
-                time.sleep(backoff)
-                backoff = min(backoff + 8, 40)
-            else:
-                print(f"\n    [!] HTTP {e.code} error on attempt {attempt}: {e}. Saved {cur_mb:.1f} MB. Retrying in 5s...", file=sys.stderr)
-                time.sleep(5)
-        except Exception as e:
-            cur_mb = (output_path.stat().st_size / (1024 * 1024)) if output_path.exists() else 0
-            print(f"\n    [!] Stream disconnected: {e}. Saved {cur_mb:.1f} MB. Resuming in 5s (attempt {attempt}/{max_retries})...", file=sys.stderr)
-            time.sleep(5)
-
+    print()
     return output_path.exists() and output_path.stat().st_size >= min_size
 
 def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000, desc: str = "1080p Video", max_speed_mb: float = 10.0, proxy: Optional[str] = None) -> bool:
