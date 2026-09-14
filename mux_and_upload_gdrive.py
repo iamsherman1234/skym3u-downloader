@@ -121,8 +121,8 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(3)
     return None
 
-def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video") -> bool:
-    """Robust chunked stream downloader with curl_cffi Chrome TLS impersonation & urllib fallback."""
+def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0) -> bool:
+    """Robust chunked stream downloader with curl_cffi Chrome TLS impersonation, bandwidth throttling & urllib fallback."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size >= min_size:
         return True
@@ -150,10 +150,19 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
                 with open(output_path, "wb") as out_f:
                     for chunk in r.iter_content(chunk_size=256 * 1024):
+                        chunk_start = time.time()
                         if not chunk:
                             break
                         out_f.write(chunk)
                         bytes_downloaded += len(chunk)
+
+                        # Rate limit pacing to stay under Cloudflare burst limits
+                        if max_speed_mb > 0:
+                            target_time = len(chunk) / (max_speed_mb * 1024 * 1024)
+                            chunk_elapsed = time.time() - chunk_start
+                            if chunk_elapsed < target_time:
+                                time.sleep(target_time - chunk_elapsed)
+
                         now = time.time()
                         if now - last_print >= 0.5 and bytes_downloaded > 0:
                             last_print = now
@@ -190,11 +199,20 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
                     with open(output_path, "wb") as out_f:
                         while True:
+                            chunk_start = time.time()
                             chunk = resp.read(256 * 1024)
                             if not chunk:
                                 break
                             out_f.write(chunk)
                             bytes_downloaded += len(chunk)
+
+                            # Rate limit pacing
+                            if max_speed_mb > 0:
+                                target_time = len(chunk) / (max_speed_mb * 1024 * 1024)
+                                chunk_elapsed = time.time() - chunk_start
+                                if chunk_elapsed < target_time:
+                                    time.sleep(target_time - chunk_elapsed)
+
                             now = time.time()
                             if now - last_print >= 0.5 and bytes_downloaded > 0:
                                 last_print = now
@@ -230,7 +248,7 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
     return False
 
-def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000, desc: str = "1080p Video") -> bool:
+def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000, desc: str = "1080p Video", max_speed_mb: float = 10.0) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
@@ -238,6 +256,7 @@ def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000
     base_cmd = [
         "curl",
         "-L",
+        "--limit-rate", f"{int(max_speed_mb)}M" if max_speed_mb > 0 else "50M",
         "--retry", "5",
         "--retry-delay", "3",
         "--connect-timeout", "20",
@@ -253,7 +272,7 @@ def download_file_resilient(url: str, output_path: Path, min_size: int = 1000000
         return True
 
     print("    [!] curl failed or range unsupported, falling back to python stream downloader...", file=sys.stderr)
-    return download_file_python(url, output_path, min_size=min_size, desc=desc)
+    return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb)
 
 def download_audio_mp4(url: str, output_path: Path) -> bool:
     if output_path.exists() and output_path.stat().st_size > 10000000:
@@ -369,7 +388,7 @@ def upload_to_rclone(local_file: Path, remote_dest: str) -> bool:
     proc = subprocess.run(cmd)
     return proc.returncode == 0
 
-def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, audio_delay: float = 1.0, video_url: Optional[str] = None, force: bool = False):
+def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, audio_delay: float = 1.0, video_url: Optional[str] = None, force: bool = False, max_speed_mb: float = 10.0):
     catalog = load_khmer_catalog()
     if not catalog:
         return
@@ -384,6 +403,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
     print(f"📡 1080p Video Source: st.111477.xyz (Netflix 1080p WEB-DL)")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Hardware Physical Padding)")
+    print(f"🚀 Speed Limit: {max_speed_mb:.1f} MB/s (Anti-Throttling Protection)")
     if pixeldrain_key:
         print(f"⚡ PixelDrain Auto-Upload: ENABLED")
     if remote_dest:
@@ -431,7 +451,7 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
         time.sleep(2)  # Cooldown pause for stream handshake
 
         print(f"    📥 Downloading 1080p video file (~2.4 GB)...")
-        if not download_file_resilient(stream_link, temp_raw_video, min_size=50000000):
+        if not download_file_resilient(stream_link, temp_raw_video, min_size=50000000, max_speed_mb=max_speed_mb):
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
 
@@ -517,6 +537,7 @@ def main():
     parser.add_argument("-w", "--work-dir", type=str, default="./samkok_work", help="Working directory")
     parser.add_argument("-d", "--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
     parser.add_argument("-f", "--force", action="store_true", help="Force re-download and re-mux even if previously marked completed")
+    parser.add_argument("--max-speed", type=float, default=10.0, help="Maximum download speed in MB/s to prevent Cloudflare burst limits (default: 10.0)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for start episode")
 
     args = parser.parse_args()
@@ -531,7 +552,8 @@ def main():
         work_dir=Path(args.work_dir),
         audio_delay=args.delay,
         video_url=args.video_url,
-        force=args.force
+        force=args.force,
+        max_speed_mb=args.max_speed
     )
 
 if __name__ == "__main__":

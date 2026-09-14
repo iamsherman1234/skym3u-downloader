@@ -116,8 +116,8 @@ def resolve_1080p_stream_url(ep_num: int) -> Optional[str]:
             time.sleep(3)
     return None
 
-def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video") -> bool:
-    """Robust chunked stream downloader with curl_cffi Chrome TLS impersonation & urllib fallback."""
+def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0) -> bool:
+    """Robust chunked stream downloader with curl_cffi Chrome TLS impersonation, bandwidth throttling, & urllib fallback."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size >= min_size:
         return True
@@ -145,10 +145,19 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
                 with open(output_path, "wb") as out_f:
                     for chunk in r.iter_content(chunk_size=256 * 1024):
+                        chunk_start = time.time()
                         if not chunk:
                             break
                         out_f.write(chunk)
                         bytes_downloaded += len(chunk)
+
+                        # Rate limit pacing to stay under Cloudflare burst limits
+                        if max_speed_mb > 0:
+                            target_time = len(chunk) / (max_speed_mb * 1024 * 1024)
+                            chunk_elapsed = time.time() - chunk_start
+                            if chunk_elapsed < target_time:
+                                time.sleep(target_time - chunk_elapsed)
+
                         now = time.time()
                         if now - last_print >= 0.5 and bytes_downloaded > 0:
                             last_print = now
@@ -185,11 +194,20 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
                     with open(output_path, "wb") as out_f:
                         while True:
+                            chunk_start = time.time()
                             chunk = resp.read(256 * 1024)
                             if not chunk:
                                 break
                             out_f.write(chunk)
                             bytes_downloaded += len(chunk)
+
+                            # Rate limit pacing
+                            if max_speed_mb > 0:
+                                target_time = len(chunk) / (max_speed_mb * 1024 * 1024)
+                                chunk_elapsed = time.time() - chunk_start
+                                if chunk_elapsed < target_time:
+                                    time.sleep(target_time - chunk_elapsed)
+
                             now = time.time()
                             if now - last_print >= 0.5 and bytes_downloaded > 0:
                                 last_print = now
@@ -225,7 +243,7 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
     return False
 
-def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_size: int = 1000000) -> bool:
+def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_size: int = 1000000, max_speed_mb: float = 10.0) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size == 0:
         output_path.unlink()
@@ -235,6 +253,7 @@ def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_
         "-x", str(connections),
         "-s", str(connections),
         "-k", "1M",
+        f"--max-download-limit={int(max_speed_mb)}M",
         "-d", str(output_path.parent),
         "-o", output_path.name,
         "-U", USER_AGENT,
@@ -250,7 +269,7 @@ def download_file_aria2c(url: str, output_path: Path, connections: int = 1, min_
     proc = subprocess.run(cmd)
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
-def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> bool:
+def download_file_curl(url: str, output_path: Path, min_size: int = 1000000, max_speed_mb: float = 10.0) -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists():
         output_path.unlink()
@@ -258,6 +277,7 @@ def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> 
     base_cmd = [
         "curl",
         "-L",
+        "--limit-rate", f"{int(max_speed_mb)}M",
         "--retry", "5",
         "--retry-delay", "3",
         "--connect-timeout", "20",
@@ -271,23 +291,23 @@ def download_file_curl(url: str, output_path: Path, min_size: int = 1000000) -> 
     proc = subprocess.run(base_cmd)
     return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
 
-def download_stream(url: str, output_path: Path, engine: str = "python", connections: int = 1, min_size: int = 1000000, desc: str = "Video") -> bool:
+def download_stream(url: str, output_path: Path, engine: str = "python", connections: int = 1, min_size: int = 1000000, desc: str = "Video", max_speed_mb: float = 10.0) -> bool:
     if engine == "python":
-        return download_file_python(url, output_path, min_size=min_size, desc=desc)
+        return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb)
     elif engine == "curl":
-        ok = download_file_curl(url, output_path, min_size=min_size)
+        ok = download_file_curl(url, output_path, min_size=min_size, max_speed_mb=max_speed_mb)
         if ok:
             return True
         print("    [!] curl failed, falling back to python stream downloader...", file=sys.stderr)
-        return download_file_python(url, output_path, min_size=min_size, desc=desc)
+        return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb)
     elif engine == "aria2c":
         res = subprocess.run(["which", "aria2c"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if res.returncode == 0:
-            ok = download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
+            ok = download_file_aria2c(url, output_path, connections=connections, min_size=min_size, max_speed_mb=max_speed_mb)
             if ok:
                 return True
             print("    [!] aria2c failed, falling back to python stream downloader...", file=sys.stderr)
-    return download_file_python(url, output_path, min_size=min_size, desc=desc)
+    return download_file_python(url, output_path, min_size=min_size, desc=desc, max_speed_mb=max_speed_mb)
 
 def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0, ep_num: int = 1) -> bool:
     """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for 100% Netflix lip-sync."""
@@ -381,7 +401,7 @@ def load_progress(state_file: Path) -> Dict[str, Any]:
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
-def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pixeldrain_key: Optional[str], work_dir: Path, downloader: str = "aria2c", connections: int = 1, audio_delay: float = 1.0, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None):
+def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pixeldrain_key: Optional[str], work_dir: Path, downloader: str = "python", connections: int = 1, audio_delay: float = 1.0, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None, max_speed_mb: float = 10.0):
     catalog = load_khmer_catalog()
     work_dir.mkdir(parents=True, exist_ok=True)
     
@@ -396,6 +416,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
     print(f"📡 1080p Video Source: st.111477.xyz / Manual Override")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Hardware Physical Padding)")
+    print(f"🚀 Speed Limit: {max_speed_mb:.1f} MB/s (Anti-Throttling Protection)")
     if pixeldrain_key:
         print(f"⚡ PixelDrain Upload: ENABLED")
     if gdrive_dir:
@@ -439,7 +460,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
         time.sleep(2)  # Cooldown pause for stream handshake
 
         print(f"[2/4] 📥 Downloading 1080p Netflix video (~2.4 GB)...")
-        if not download_stream(video_stream_url, temp_raw_video, engine=downloader, connections=connections, min_size=50000000, desc="1080p Video"):
+        if not download_stream(video_stream_url, temp_raw_video, engine=downloader, connections=connections, min_size=50000000, desc="1080p Video", max_speed_mb=max_speed_mb):
             print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
             continue
 
@@ -451,7 +472,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
-        if not download_stream(audio_stream_url, temp_audio_mp4, engine=downloader, connections=min(connections, 4), min_size=10000000, desc="Khmer Audio"):
+        if not download_stream(audio_stream_url, temp_audio_mp4, engine=downloader, connections=min(connections, 4), min_size=10000000, desc="Khmer Audio", max_speed_mb=max_speed_mb):
             print(f"[-] Audio download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
@@ -507,6 +528,7 @@ def main():
     parser.add_argument("-d", "--downloader", type=str, choices=["python", "curl", "aria2c"], default="python", help="Downloader engine (default: python)")
     parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download")
     parser.add_argument("--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
+    parser.add_argument("--max-speed", type=float, default=10.0, help="Maximum download speed in MB/s to prevent Cloudflare burst limits (default: 10.0)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
     parser.add_argument("--audio-url", type=str, default=None, help="Manual Khmer audio URL override for the episode")
 
@@ -525,7 +547,8 @@ def main():
         connections=args.connections,
         audio_delay=args.delay,
         manual_video_url=args.video_url,
-        manual_audio_url=args.audio_url
+        manual_audio_url=args.audio_url,
+        max_speed_mb=args.max_speed
     )
 
 if __name__ == "__main__":
