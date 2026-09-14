@@ -223,7 +223,7 @@ def upload_to_rclone(local_file: Path, remote_dest: str) -> bool:
     proc = subprocess.run(cmd)
     return proc.returncode == 0
 
-def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, audio_delay: float = 1.0, video_url: Optional[str] = None):
+def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pixeldrain_key: Optional[str], work_dir: Path, audio_delay: float = 1.0, video_url: Optional[str] = None, force: bool = False):
     catalog = load_khmer_catalog()
     if not catalog:
         return
@@ -245,17 +245,30 @@ def process_pipeline(start_ep: int, end_ep: int, remote_dest: Optional[str], pix
     print(f"{'='*80}\n")
 
     for ep_num in range(start_ep, end_ep + 1):
-        if ep_num in progress["completed"]:
-            print(f"[✓] Episode {ep_num:02d} already completed. Skipping.")
-            continue
-
-        print(f"\n--- [ Processing Episode {ep_num:02d} / {end_ep:02d} ] ---")
-        ep_data = catalog[ep_num - 1]
-
         temp_raw_video = work_dir / f"raw_1080p_e{ep_num:02d}.mkv"
         temp_audio_mp4 = work_dir / f"raw_komsan_e{ep_num:02d}.mp4"
         temp_khmer_aac = work_dir / f"khmer_audio_e{ep_num:02d}.aac"
         final_mkv = work_dir / f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.NF.WEB-DL.KhmerDub.mkv"
+
+        if ep_num in progress["completed"] and not force:
+            if pixeldrain_key and str(ep_num) not in progress.get("pixeldrain_links", {}) and final_mkv.exists():
+                print(f"[!] Episode {ep_num:02d} was remuxed previously but not yet uploaded to PixelDrain. Uploading now...")
+                pd_link = upload_to_pixeldrain(final_mkv, pixeldrain_key)
+                if pd_link:
+                    progress.setdefault("pixeldrain_links", {})[str(ep_num)] = pd_link
+                    with open(links_file, "a", encoding="utf-8") as lf:
+                        lf.write(f"Episode {ep_num:02d}: {pd_link}\n")
+                    save_progress(state_file, progress)
+                    if final_mkv.exists():
+                        final_mkv.unlink()
+                        print(f"[+] 🧹 Cleaned up local video file to save disk space.")
+                continue
+            else:
+                print(f"[✓] Episode {ep_num:02d} already completed. Skipping.")
+                continue
+
+        print(f"\n--- [ Processing Episode {ep_num:02d} / {end_ep:02d} ] ---")
+        ep_data = catalog[ep_num - 1]
 
         # 1. Resolve & Download 1080p Video Stream
         stream_link = video_url if (video_url and ep_num == start_ep) else None
@@ -356,6 +369,7 @@ def main():
     parser.add_argument("-r", "--remote", type=str, default="none", help="Rclone remote destination (default: none)")
     parser.add_argument("-w", "--work-dir", type=str, default="./samkok_work", help="Working directory")
     parser.add_argument("-d", "--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
+    parser.add_argument("-f", "--force", action="store_true", help="Force re-download and re-mux even if previously marked completed")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for start episode")
 
     args = parser.parse_args()
@@ -369,7 +383,8 @@ def main():
         pixeldrain_key=pd_key,
         work_dir=Path(args.work_dir),
         audio_delay=args.delay,
-        video_url=args.video_url
+        video_url=args.video_url,
+        force=args.force
     )
 
 if __name__ == "__main__":
