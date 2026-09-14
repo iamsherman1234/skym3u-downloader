@@ -4,7 +4,8 @@ Samkok 1080p Netflix Khmer Dub Muxer with PixelDrain & GDrive Uploader for Googl
 Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Netflix 1080p WEB-DL (st.111477.xyz)
 Seamlessly processes episodes in Google Colab:
 - Resolves 1080p Netflix stream from st.111477.xyz or uses manual URL override
-- Extracts Khmer AAC audio from TheKomsan (Rumble CDN) or manual audio URL
+- Extracts Khmer AAC audio from TheKomsan (Rumble CDN)
+- Applies physical silence delay (+1.0s) for player-compatible lip sync
 - Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles
 - Auto-uploads directly to PixelDrain and/or mounted Google Drive
 """
@@ -25,7 +26,7 @@ SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
 STREMIO_BASE = "https://st.111477.xyz"
 A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-DEFAULT_AUDIO_OFFSET = 0.0  # Perfect 1:1 sync between TheKomsan & Netflix 1080p
+DEFAULT_AUDIO_DELAY = 1.0  # +1.0 second delay to match Netflix 1080p intro
 DEFAULT_PIXELDRAIN_KEY = "cafccc0b-66db-4f1d-a5bb-de45da49f9d5"
 
 def load_khmer_catalog() -> List[Dict[str, Any]]:
@@ -133,26 +134,32 @@ def download_stream(url: str, output_path: Path, engine: str = "aria2c", connect
             return download_file_aria2c(url, output_path, connections=connections, min_size=min_size)
     return download_file_curl(url, output_path, min_size=min_size)
 
-def extract_aac_from_video(input_video: Path, output_aac: Path) -> bool:
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", str(input_video),
-        "-vn", "-c:a", "copy",
-        str(output_aac)
-    ]
+def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 1.0) -> bool:
+    """Extracts audio and applies physical silence padding so sync works reliably on all media players."""
+    if abs(delay_seconds) > 0.01:
+        delay_ms = int(delay_seconds * 1000)
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_video),
+            "-vn",
+            "-filter:a", f"adelay={delay_ms}|{delay_ms}",
+            "-c:a", "aac", "-b:a", "128k",
+            str(output_aac)
+        ]
+    else:
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(input_video),
+            "-vn", "-c:a", "copy",
+            str(output_aac)
+        ]
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc.returncode == 0 and output_aac.exists() and output_aac.stat().st_size > 500000
 
-def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int, audio_offset: float = 0.0) -> bool:
-    cmd = ["ffmpeg", "-y", "-i", str(video_path)]
-    
-    if abs(audio_offset) > 0.001:
-        if audio_offset > 0:
-            cmd.extend(["-itsoffset", f"{audio_offset:.3f}"])
-        else:
-            cmd.extend(["-ss", f"{abs(audio_offset):.3f}"])
-
-    cmd.extend([
+def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
         "-i", str(audio_path),
         "-map", "0:v:0",
         "-map", "1:a:0",
@@ -170,7 +177,7 @@ def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep
         "-metadata", f"title=Three Kingdoms (2010) - Episode {ep_num:02d} [1080p Khmer Dubbed]",
         "-t", "2618",
         str(output_mkv)
-    ])
+    ]
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return proc.returncode == 0 and output_mkv.exists() and output_mkv.stat().st_size > 10000000
 
@@ -207,7 +214,7 @@ def load_progress(state_file: Path) -> Dict[str, Any]:
 def save_progress(state_file: Path, progress: Dict[str, Any]):
     state_file.write_text(json.dumps(progress, indent=2), encoding="utf-8")
 
-def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pixeldrain_key: Optional[str], work_dir: Path, downloader: str = "aria2c", connections: int = 1, audio_offset: float = 0.0, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None):
+def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pixeldrain_key: Optional[str], work_dir: Path, downloader: str = "aria2c", connections: int = 1, audio_delay: float = 1.0, manual_video_url: Optional[str] = None, manual_audio_url: Optional[str] = None):
     catalog = load_khmer_catalog()
     work_dir.mkdir(parents=True, exist_ok=True)
     
@@ -221,7 +228,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
     print(f"📡 1080p Video Source: st.111477.xyz / Manual Override")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
-    print(f"⏱️  Audio Sync Offset: {audio_offset:+.3f}s (Direct 1:1)")
+    print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Hardware Physical Padding)")
     if pixeldrain_key:
         print(f"⚡ PixelDrain Upload: ENABLED")
     if gdrive_dir:
@@ -268,7 +275,7 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
             print(f"[-] Video download failed for Episode {ep_num:02d}.", file=sys.stderr)
             continue
 
-        # 2. Download Khmer Audio Stream
+        # 2. Download Khmer Audio Stream & Apply Hardware Sync Delay
         print(f"[3/4] 🎙️ Downloading Khmer audio stream from TheKomsan...")
         audio_stream_url = manual_audio_url or ep_data.get("file")
         if not audio_stream_url:
@@ -281,12 +288,13 @@ def process_pipeline(start_ep: int, end_ep: int, gdrive_dir: Optional[Path], pix
             if temp_raw_video.exists(): temp_raw_video.unlink()
             continue
 
-        extract_aac_from_video(temp_audio_mp4, temp_khmer_aac)
+        print(f"    ⏱️ Applying physical +{audio_delay:.3f}s sync padding to audio...")
+        extract_and_delay_audio(temp_audio_mp4, temp_khmer_aac, delay_seconds=audio_delay)
         if temp_audio_mp4.exists(): temp_audio_mp4.unlink()
 
         # 3. Losslessly Remux 1080p Video + Khmer Audio + Mandarin + Subtitles
         print(f"[4/4] ⚡ Losslessly remuxing into 1080p Dual-Audio MKV...")
-        mux_ok = remux_local_streams(temp_raw_video, temp_khmer_aac, temp_final_mkv, ep_num, audio_offset=audio_offset)
+        mux_ok = remux_local_streams(temp_raw_video, temp_khmer_aac, temp_final_mkv, ep_num)
         if temp_raw_video.exists(): temp_raw_video.unlink()
         if temp_khmer_aac.exists(): temp_khmer_aac.unlink()
 
@@ -329,7 +337,7 @@ def main():
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
     parser.add_argument("-d", "--downloader", type=str, choices=["aria2c", "curl"], default="aria2c", help="Downloader engine")
     parser.add_argument("-c", "--connections", type=int, default=1, help="Number of connections per download")
-    parser.add_argument("-o", "--audio-offset", type=float, default=DEFAULT_AUDIO_OFFSET, help="Audio sync offset in seconds (default: 0.0)")
+    parser.add_argument("--delay", type=float, default=DEFAULT_AUDIO_DELAY, help="Audio delay in seconds (default: 1.0)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual 1080p video URL override for the episode")
     parser.add_argument("--audio-url", type=str, default=None, help="Manual Khmer audio URL override for the episode")
 
@@ -346,7 +354,7 @@ def main():
         work_dir=Path(args.work_dir),
         downloader=args.downloader,
         connections=args.connections,
-        audio_offset=args.audio_offset,
+        audio_delay=args.delay,
         manual_video_url=args.video_url,
         manual_audio_url=args.audio_url
     )
