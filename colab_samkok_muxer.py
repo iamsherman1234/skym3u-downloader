@@ -3,7 +3,8 @@
 Samkok 1080p Complete 95-Episode Colab Pipeline & Auto-Uploader
 Source: Jiang Hu 1080p HD Direct CDN (urleps.json / urleps.txt) + TheKomsan Khmer Dub
 Features:
-- Fast multi-threaded downloading for all 95 episodes via direct CDN links
+- PixelDrain Cloud Pre-Check: Auto-checks user's PixelDrain account and skips any episode already uploaded
+- Fast multi-threaded downloading for all episodes via direct CDN links
 - Torrent fallback (samkok_1080p.torrent) if direct link is missing
 - Extracts Khmer AAC audio from TheKomsan (Rumble CDN)
 - Applies audio sync delay (+0.0s for Jiang Hu TV cut) and ad cutting (Ep 1)
@@ -17,6 +18,7 @@ import os
 import re
 import json
 import time
+import base64
 import argparse
 import subprocess
 import urllib.request
@@ -145,6 +147,39 @@ def load_url_file(custom_path: Optional[str] = None) -> Dict[int, str]:
             except Exception as e:
                 print(f"[-] Warning parsing {p}: {e}", file=sys.stderr)
     return {}
+
+def fetch_pixeldrain_existing_episodes(api_key: Optional[str]) -> Dict[int, Dict[str, Any]]:
+    """Queries PixelDrain user account to identify already uploaded episodes."""
+    if not api_key:
+        return {}
+    url = "https://pixeldrain.com/api/user/files"
+    auth = base64.b64encode(f":{api_key}".encode()).decode()
+    headers = {"Authorization": f"Basic {auth}", "User-Agent": USER_AGENT}
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            files = data.get("files", [])
+            existing = {}
+            for f in files:
+                name = f.get("name", "")
+                size = f.get("size", 0)
+                if size < 500000000:  # Only consider complete video files (> 500 MB)
+                    continue
+                m = re.search(r'Three\.Kingdoms\.2010\.S01E(\d+)', name, re.IGNORECASE) or re.search(r'Samkok.*E(?:pisode)?\.?(\d+)', name, re.IGNORECASE)
+                if m:
+                    ep = int(m.group(1))
+                    pd_url = f"https://pixeldrain.com/u/{f.get('id')}"
+                    existing[ep] = {
+                        "id": f.get("id"),
+                        "name": name,
+                        "size_mb": size / (1024 * 1024),
+                        "url": pd_url
+                    }
+            return existing
+    except Exception as e:
+        print(f"[-] Warning: Failed to query PixelDrain account: {e}", file=sys.stderr)
+        return {}
 
 def find_torrent_source(custom_torrent: Optional[str] = None) -> str:
     if custom_torrent:
@@ -435,7 +470,8 @@ def process_pipeline(
     custom_video_url: Optional[str] = None,
     custom_torrent: Optional[str] = None,
     audio_delay: float = 0.0,
-    manual_audio_url: Optional[str] = None
+    manual_audio_url: Optional[str] = None,
+    check_pixeldrain_cloud: bool = True
 ):
     catalog = load_khmer_catalog()
     url_map = load_url_file(url_file)
@@ -447,6 +483,24 @@ def process_pipeline(
     links_file = state_dir / "pixeldrain_links.txt"
     progress = load_progress(state_file)
 
+    # 1. PixelDrain Cloud Pre-Check: Check existing uploaded episodes on PixelDrain account
+    pd_existing = {}
+    if check_pixeldrain_cloud and pixeldrain_key:
+        print("[*] 🔍 Checking PixelDrain account for already uploaded episodes...")
+        pd_existing = fetch_pixeldrain_existing_episodes(pixeldrain_key)
+        if pd_existing:
+            print(f"[+] Found {len(pd_existing)} episodes already uploaded on PixelDrain account!")
+            # Update links file and progress
+            for ep, info in sorted(pd_existing.items()):
+                progress.setdefault("pixeldrain_links", {})[str(ep)] = info["url"]
+                if ep not in progress["completed"]:
+                    progress["completed"].append(ep)
+            save_progress(state_file, progress)
+            # Re-write links file cleanly
+            with open(links_file, "w", encoding="utf-8") as lf:
+                for ep_num in sorted([int(k) for k in progress["pixeldrain_links"].keys()]):
+                    lf.write(f"Episode {ep_num:02d}: {progress['pixeldrain_links'][str(ep_num)]}\n")
+
     torrent_source = find_torrent_source(custom_torrent)
 
     print(f"\n{'='*80}")
@@ -455,19 +509,26 @@ def process_pipeline(
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Lip Sync Padding)")
     if pixeldrain_key:
-        print(f"⚡ PixelDrain Upload: ENABLED")
+        print(f"⚡ PixelDrain Upload: ENABLED ({len(pd_existing)} already on cloud)")
     if gdrive_dir:
         print(f"📁 Output Target (GDrive): {gdrive_dir}")
     print(f"{'='*80}\n")
 
     for ep_num in range(start_ep, end_ep + 1):
-        if ep_num in progress["completed"]:
-            print(f"[✓] Episode {ep_num:02d} already completed. Skipping.")
-            continue
-
         target_name = f"Three.Kingdoms.2010.S01E{ep_num:02d}.1080p.KhmerDub.mkv"
         final_gdrive_path = (gdrive_dir / target_name) if gdrive_dir else None
 
+        # Check if already completed via PixelDrain Cloud
+        if ep_num in pd_existing:
+            print(f"[✓] Episode {ep_num:02d} already in PixelDrain ({pd_existing[ep_num]['url']}). Skipping.")
+            continue
+
+        # Check local state progress
+        if ep_num in progress["completed"]:
+            print(f"[✓] Episode {ep_num:02d} marked completed in progress. Skipping.")
+            continue
+
+        # Check Google Drive
         if final_gdrive_path and final_gdrive_path.exists() and final_gdrive_path.stat().st_size > 100000000:
             print(f"[✓] File already exists on Google Drive ({target_name}). Skipping.")
             progress["completed"].append(ep_num)
@@ -565,13 +626,14 @@ def process_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Google Colab 1080p Three Kingdoms Khmer Dub Remuxer (Direct CDN & Torrent)."
+        description="Google Colab 1080p Three Kingdoms Khmer Dub Remuxer with PixelDrain Pre-Check."
     )
     parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
     parser.add_argument("-p", "--pixeldrain", action="store_true", default=True, help="Enable PixelDrain auto-upload (default: True)")
     parser.add_argument("--no-pixeldrain", dest="pixeldrain", action="store_false", help="Disable PixelDrain auto-upload")
     parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
+    parser.add_argument("--no-pd-check", dest="pd_check", action="store_false", default=True, help="Disable checking existing files on PixelDrain")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
     parser.add_argument("--url-file", type=str, default=None, help="Custom path to URL mapping file (e.g. urleps.txt or urleps.json)")
@@ -595,7 +657,8 @@ def main():
         custom_video_url=args.video_url,
         custom_torrent=args.torrent,
         audio_delay=args.delay,
-        manual_audio_url=args.audio_url
+        manual_audio_url=args.audio_url,
+        check_pixeldrain_cloud=args.pd_check
     )
 
 if __name__ == "__main__":
