@@ -1,12 +1,12 @@
 # SkyM3U Verified Active Servers (2 Xtream, 0 Stalker)
-# Updated: 2026-09-14 04:17:10 UTC
+# Updated: 2026-09-15 04:17:08 UTC
 
 ### XTREAM SERVERS ###
 Server: http://uesztesm.ioiju.com:80
     ID: B35DKUNA
   CODE: M7EAAYCS
-   EXP: 2026-10-29 (45d left)
-  CONN: 0/2
+   EXP: 2026-10-29 (44d left)
+  CONN: 3/2
    M3U: http://uesztesm.ioiju.com:80/get.php?username=B35DKUNA&password=M7EAAYCS&type=m3u_plus&output=ts
 --------------------------------------------------
 Server: http://portal5458.com:8080
