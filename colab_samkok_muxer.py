@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Samkok 1080p Torrent & Netflix Khmer Dub Muxer with PixelDrain & GDrive Uploader for Google Colab
-Source: TheKomsan (95-Episode Complete Khmer Dubbed) + Jiang Hu 1080p HD Torrent / Netflix 1080p WEB-DL
-Seamlessly processes episodes in Google Colab:
-- Downloads individual 1080p episode from Torrent (Jiang Hu 1080p HD) via aria2c (Zero Cloudflare rate limits!)
+Samkok 1080p Colab Remuxer & PixelDrain / GDrive Auto-Uploader
+Source: Jiang Hu 1080p HD (Direct CDN URLs from urleps8795.txt or Torrent) + TheKomsan Khmer Dub
+Features:
+- Fast multi-connection downloading via direct CDN links (urleps8795.txt) with auto-fallback to Torrent
 - Extracts Khmer AAC audio from TheKomsan (Rumble CDN)
-- Applies audio sync delay and ad cutting
-- Losslessly muxes into 1080p Dual Audio MKV with Chinese Subtitles / Original Audio
+- Applies audio sync delay (+0.0s for Jiang Hu TV cut) and ad cutting
+- Losslessly remuxes into 1080p Dual Audio MKV with Chinese Subtitles / Original Audio
 - Auto-uploads directly to PixelDrain and/or mounted Google Drive
-- Cleans up temporary files after each episode (< 3 GB disk usage)
+- Sequential processing with immediate temp file cleanup (< 3 GB disk usage)
 """
 
 import sys
@@ -30,8 +30,6 @@ except ImportError:
     HAS_CURL_CFFI = False
 
 SERIES_IMDB_ID = "tt1514753"  # Three Kingdoms (2010)
-STREMIO_BASE = "https://st.111477.xyz"
-A11_BASE_B64 = "aHR0cHM6Ly9hLjExMTQ3Ny54eXov"
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 DEFAULT_PIXELDRAIN_KEY = "cafccc0b-66db-4f1d-a5bb-de45da49f9d5"
 
@@ -82,6 +80,52 @@ def load_khmer_catalog() -> List[Dict[str, Any]]:
         print(f"[-] Error loading Khmer catalog: {e}", file=sys.stderr)
         return []
 
+def load_url_file(custom_path: Optional[str] = None) -> Dict[int, str]:
+    candidates = []
+    if custom_path:
+        candidates.append(Path(custom_path))
+    candidates.extend([
+        Path("urleps8795.json"),
+        Path("urleps8795.txt"),
+        Path("/content/skym3u-downloader/urleps8795.json"),
+        Path("/content/skym3u-downloader/urleps8795.txt"),
+        Path("/root/skym3u-downloader/urleps8795.json"),
+        Path("/root/skym3u-downloader/urleps8795.txt"),
+        Path(__file__).parent / "urleps8795.json" if "__file__" in globals() else None,
+        Path(__file__).parent / "urleps8795.txt" if "__file__" in globals() else None,
+    ])
+
+    for p in candidates:
+        if p and p.exists():
+            try:
+                content = p.read_text(encoding="utf-8").strip()
+                # Try JSON format
+                try:
+                    data = json.loads(content)
+                    if isinstance(data, dict):
+                        res = {int(k): v.strip() for k, v in data.items() if str(k).isdigit() and v.strip().startswith("http")}
+                        if res:
+                            print(f"[+] Loaded {len(res)} direct episode URLs from '{p.name}'")
+                            return res
+                except Exception:
+                    pass
+
+                # Try Line-by-line format
+                mapping = {}
+                for line in content.splitlines():
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    m = re.match(r"^(\d+)\s*[:=\s]\s*(https?://\S+)", line)
+                    if m:
+                        mapping[int(m.group(1))] = m.group(2).strip()
+                if mapping:
+                    print(f"[+] Loaded {len(mapping)} direct episode URLs from '{p.name}'")
+                    return mapping
+            except Exception as e:
+                print(f"[-] Warning parsing {p}: {e}", file=sys.stderr)
+    return {}
+
 def find_torrent_source(custom_torrent: Optional[str] = None) -> str:
     if custom_torrent:
         if Path(custom_torrent).exists():
@@ -102,82 +146,35 @@ def find_torrent_source(custom_torrent: Optional[str] = None) -> str:
 
     return DEFAULT_MAGNET_LINK
 
-def download_torrent_episode(ep_num: int, work_dir: Path, torrent_source: str) -> Optional[Path]:
-    """
-    Downloads a single 1080p episode from the Jiang Hu Three Kingdoms torrent using aria2c.
-    Episode index mapping: Ep 1 -> 3, Ep 2 -> 5, ..., Ep N -> (N * 2) + 1.
-    """
-    work_dir.mkdir(parents=True, exist_ok=True)
-    file_index = (ep_num * 2) + 1
-    expected_rel_name = f"[Jiang Hu] Three Kingdoms 2010 HD {ep_num:02d}.mp4"
-    expected_full_path = work_dir / "[Jiang Hu] Three Kingdoms 2010 HD" / expected_rel_name
+def download_http_aria2c(url: str, output_path: Path, connections: int = 4, min_size: int = 50000000) -> bool:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if output_path.exists() and output_path.stat().st_size >= min_size:
+        return True
 
-    # If already downloaded and complete (~1.5 GB)
-    if expected_full_path.exists() and expected_full_path.stat().st_size > 500000000:
-        # Check if no .aria2 file exists for it
-        aria2_ctrl = work_dir / f"[Jiang Hu] Three Kingdoms 2010 HD.aria2"
-        if not aria2_ctrl.exists():
-            print(f"    [✓] Torrent video already downloaded: {expected_full_path.name}")
-            return expected_full_path
-
-    print(f"    🧲 Downloading Episode {ep_num:02d} via BitTorrent (Index: {file_index})...")
     cmd = [
         "aria2c",
-        f"--select-file={file_index}",
-        "--seed-time=0",
-        "--file-allocation=none",
-        "--bt-enable-lpd=true",
-        "--enable-dht=true",
-        "--dht-listen-port=6881",
-        "--enable-peer-exchange=true",
-        "--bt-max-peers=120",
-        "--max-overall-upload-limit=10K",
-        "--summary-interval=5",
-        "--console-log-level=warn",
-        f"--dir={work_dir}",
-        torrent_source
+        "-x", str(connections),
+        "-s", str(connections),
+        "-k", "2M",
+        "-d", str(output_path.parent),
+        "-o", output_path.name,
+        "-U", USER_AGENT,
+        "--check-certificate=false",
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
+        "--summary-interval=3",
+        "--max-tries=5",
+        "--retry-wait=2",
+        url
     ]
-
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            universal_newlines=True
-        )
-
-        for line in proc.stdout:
-            line_str = line.strip()
-            if not line_str:
-                continue
-            # Display progress lines cleanly
-            if "[" in line_str and "]" in line_str and ("MiB" in line_str or "GiB" in line_str or "ETA" in line_str):
-                print(f"\r    📥 [Torrent E{ep_num:02d}] {line_str}", end="", flush=True)
-            elif "Download complete" in line_str or "Seeds:" in line_str or "errorCode" in line_str:
-                print(f"\n    [aria2] {line_str}")
-
-        proc.wait()
-        print()
-
-        if expected_full_path.exists() and expected_full_path.stat().st_size > 500000000:
-            print(f"    [+] Successfully downloaded: {expected_full_path.name} ({expected_full_path.stat().st_size / (1024*1024):.1f} MB)")
-            return expected_full_path
-        else:
-            # Check if file was downloaded directly to work_dir without subfolder
-            alt_path = work_dir / expected_rel_name
-            if alt_path.exists() and alt_path.stat().st_size > 500000000:
-                return alt_path
-            print(f"    [-] Expected torrent output file not found or incomplete: {expected_full_path}", file=sys.stderr)
-            return None
-
+        proc = subprocess.run(cmd)
+        return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size >= min_size
     except Exception as e:
-        print(f"    [-] aria2c execution error: {e}", file=sys.stderr)
-        return None
+        print(f"    [-] aria2c HTTP error: {e}", file=sys.stderr)
+        return False
 
-def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Audio", max_speed_mb: float = 0.0) -> bool:
-    """Slice-range & streaming downloader for audio & CDN files."""
+def download_file_python(url: str, output_path: Path, min_size: int = 1000000, desc: str = "Audio") -> bool:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if output_path.exists() and output_path.stat().st_size >= min_size:
         return True
@@ -239,11 +236,89 @@ def download_file_python(url: str, output_path: Path, min_size: int = 1000000, d
 
     return False
 
+def download_torrent_aria2c(ep_num: int, work_dir: Path, torrent_source: str) -> Optional[Path]:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    file_index = (ep_num * 2) + 1
+    expected_rel_name = f"[Jiang Hu] Three Kingdoms 2010 HD {ep_num:02d}.mp4"
+    expected_full_path = work_dir / "[Jiang Hu] Three Kingdoms 2010 HD" / expected_rel_name
+
+    if expected_full_path.exists() and expected_full_path.stat().st_size > 500000000:
+        aria2_ctrl = work_dir / f"[Jiang Hu] Three Kingdoms 2010 HD.aria2"
+        if not aria2_ctrl.exists():
+            print(f"    [✓] Torrent video already downloaded: {expected_full_path.name}")
+            return expected_full_path
+
+    print(f"    🧲 Downloading Episode {ep_num:02d} via BitTorrent aria2c (Index: {file_index})...")
+    
+    dht_file = Path("/tmp/dht.dat")
+    if not dht_file.exists():
+        try: dht_file.touch()
+        except Exception: pass
+
+    cmd = [
+        "aria2c",
+        f"--select-file={file_index}",
+        "--seed-time=0",
+        "--file-allocation=none",
+        "--disable-ipv6=true",
+        "--bt-enable-lpd=true",
+        "--enable-dht=true",
+        "--dht-listen-port=6881-6999",
+        "--listen-port=6881-6999",
+        f"--dht-file-path={dht_file}",
+        "--dht-entry-point=router.bittorrent.com:6881",
+        "--dht-entry-point=dht.transmissionbt.com:6881",
+        "--dht-entry-point=router.utorrent.com:6881",
+        "--enable-peer-exchange=true",
+        "--bt-max-peers=150",
+        "--max-overall-upload-limit=10K",
+        "--summary-interval=3",
+        "--console-log-level=warn",
+        "--peer-id-prefix=-TR3000-",
+        "--user-agent=Transmission/3.00",
+        f"--dir={work_dir}",
+        torrent_source
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+            universal_newlines=True
+        )
+
+        for line in proc.stdout:
+            line_str = line.strip()
+            if not line_str:
+                continue
+            if "[" in line_str and "]" in line_str and ("MiB" in line_str or "GiB" in line_str or "ETA" in line_str or "DL:" in line_str):
+                print(f"\r    📥 [Torrent E{ep_num:02d}] {line_str}", end="", flush=True)
+            elif "Download complete" in line_str or "Seeds:" in line_str:
+                print(f"\n    [aria2] {line_str}")
+
+        proc.wait()
+        print()
+
+        if expected_full_path.exists() and expected_full_path.stat().st_size > 500000000:
+            print(f"    [+] Successfully downloaded: {expected_full_path.name} ({expected_full_path.stat().st_size / (1024*1024):.1f} MB)")
+            return expected_full_path
+        else:
+            alt_path = work_dir / expected_rel_name
+            if alt_path.exists() and alt_path.stat().st_size > 500000000:
+                return alt_path
+            print(f"    [-] Expected torrent output file not found or incomplete: {expected_full_path}", file=sys.stderr)
+            return None
+
+    except Exception as e:
+        print(f"    [-] aria2c execution error: {e}", file=sys.stderr)
+        return None
+
 def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: float = 0.0, ep_num: int = 1) -> bool:
-    """Extracts audio, removes commercial ad if Episode 1, and applies physical silence delay for lip-sync."""
     delay_ms = int(delay_seconds * 1000)
     if ep_num == 1:
-        # Episode 1 contains a 15.8-second commercial ad inserted between 1456.0s and 1471.8s
         filter_str = f"[0:a]asplit=2[a1][a2]; [a1]atrim=0:1456.0,asetpts=PTS-STARTPTS[p1]; [a2]atrim=start=1471.8,asetpts=PTS-STARTPTS[p2]; [p1][p2]concat=n=2:v=0:a=1[acut]; [acut]adelay={delay_ms}|{delay_ms}[aout]" if abs(delay_seconds) > 0.001 else f"[0:a]asplit=2[a1][a2]; [a1]atrim=0:1456.0,asetpts=PTS-STARTPTS[p1]; [a2]atrim=start=1471.8,asetpts=PTS-STARTPTS[p2]; [p1][p2]concat=n=2:v=0:a=1[aout]"
         cmd = [
             "ffmpeg", "-y",
@@ -274,7 +349,6 @@ def extract_and_delay_audio(input_video: Path, output_aac: Path, delay_seconds: 
     return proc.returncode == 0 and output_aac.exists() and output_aac.stat().st_size > 500000
 
 def remux_local_streams(video_path: Path, audio_path: Path, output_mkv: Path, ep_num: int) -> bool:
-    """Losslessly remuxes 1080p Video + Khmer Audio (Default) + Original Audio into MKV."""
     cmd = [
         "ffmpeg", "-y",
         "-i", str(video_path),
@@ -337,12 +411,14 @@ def process_pipeline(
     gdrive_dir: Optional[Path],
     pixeldrain_key: Optional[str],
     work_dir: Path,
-    source: str = "torrent",
+    url_file: Optional[str] = None,
+    custom_video_url: Optional[str] = None,
     custom_torrent: Optional[str] = None,
     audio_delay: float = 0.0,
     manual_audio_url: Optional[str] = None
 ):
     catalog = load_khmer_catalog()
+    url_map = load_url_file(url_file)
     work_dir.mkdir(parents=True, exist_ok=True)
     
     state_dir = gdrive_dir if gdrive_dir else work_dir
@@ -351,11 +427,11 @@ def process_pipeline(
     links_file = state_dir / "pixeldrain_links.txt"
     progress = load_progress(state_file)
 
-    torrent_source = find_torrent_source(custom_torrent) if source == "torrent" else None
+    torrent_source = find_torrent_source(custom_torrent)
 
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
-    print(f"📡 1080p Video Source: {'Jiang Hu 1080p Torrent (aria2c)' if source == 'torrent' else 'HTTP Stream'}")
+    print(f"📡 1080p Video Source: Direct CDN URLs / Torrent Fallback")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Lip Sync Padding)")
     if pixeldrain_key:
@@ -381,13 +457,30 @@ def process_pipeline(
         print(f"\n--- [ Processing Episode {ep_num:02d} / {end_ep:02d} ] ---")
         ep_data = catalog[ep_num - 1] if catalog and ep_num - 1 < len(catalog) else {}
 
+        temp_raw_video = work_dir / f"raw_1080p_e{ep_num:02d}.mp4"
         temp_audio_mp4 = work_dir / f"raw_komsan_e{ep_num:02d}.mp4"
         temp_khmer_aac = work_dir / f"khmer_audio_e{ep_num:02d}.aac"
         temp_final_mkv = work_dir / target_name
 
-        # 1. Download 1080p Video via Torrent (aria2c)
-        print(f"[1/4] 📥 Fetching 1080p video for Episode {ep_num:02d} via Torrent...")
-        raw_video_path = download_torrent_episode(ep_num, work_dir, torrent_source)
+        # 1. Download 1080p Video
+        direct_url = custom_video_url if (custom_video_url and ep_num == start_ep) else url_map.get(ep_num)
+        raw_video_path = None
+
+        if direct_url:
+            print(f"[1/4] 🚀 Downloading 1080p video from Direct CDN link...")
+            ok = download_http_aria2c(direct_url, temp_raw_video, connections=4, min_size=50000000)
+            if not ok:
+                print("    [!] aria2c failed, trying direct python stream downloader...", file=sys.stderr)
+                ok = download_file_python(direct_url, temp_raw_video, min_size=50000000, desc="1080p Video")
+            if ok:
+                raw_video_path = temp_raw_video
+            else:
+                print(f"    [-] Direct CDN download failed for Episode {ep_num:02d}. Trying torrent fallback...", file=sys.stderr)
+
+        if not raw_video_path:
+            print(f"[1/4] 🧲 Fetching 1080p video for Episode {ep_num:02d} via BitTorrent...")
+            raw_video_path = download_torrent_aria2c(ep_num, work_dir, torrent_source)
+
         if not raw_video_path or not raw_video_path.exists():
             print(f"[-] Video download failed for Episode {ep_num:02d}. Skipping.", file=sys.stderr)
             continue
@@ -419,7 +512,6 @@ def process_pipeline(
             raw_video_path.unlink()
         if temp_khmer_aac.exists():
             temp_khmer_aac.unlink()
-        # Clean aria2 control files
         for f in work_dir.glob("*.aria2"):
             try: f.unlink()
             except Exception: pass
@@ -453,18 +545,19 @@ def process_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Google Colab 1080p Three Kingdoms Khmer Dub Remuxer (Torrent & TheKomsan)."
+        description="Google Colab 1080p Three Kingdoms Khmer Dub Remuxer (Direct CDN & Torrent)."
     )
-    parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
+    parser.add_argument("-s", "--start", type=int, default=87, help="Starting episode number (default: 87)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
     parser.add_argument("-p", "--pixeldrain", action="store_true", default=True, help="Enable PixelDrain auto-upload (default: True)")
     parser.add_argument("--no-pixeldrain", dest="pixeldrain", action="store_false", help="Disable PixelDrain auto-upload")
     parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
-    parser.add_argument("--source", type=str, choices=["torrent", "http"], default="torrent", help="Video source (default: torrent)")
-    parser.add_argument("--torrent", type=str, default=None, help="Path to .torrent file or magnet link")
-    parser.add_argument("--delay", type=float, default=0.0, help="Audio delay in seconds (default: 0.0 for Jiang Hu broadcast cut)")
+    parser.add_argument("--url-file", type=str, default=None, help="Custom path to URL mapping file (e.g. urleps8795.txt or urleps8795.json)")
+    parser.add_argument("--video-url", type=str, default=None, help="Manual direct video URL override")
+    parser.add_argument("--torrent", type=str, default=None, help="Path to .torrent file or magnet link fallback")
+    parser.add_argument("--delay", type=float, default=0.0, help="Audio delay in seconds (default: 0.0)")
     parser.add_argument("--audio-url", type=str, default=None, help="Manual Khmer audio URL override for the episode")
 
     args = parser.parse_args()
@@ -478,7 +571,8 @@ def main():
         gdrive_dir=gdrive_dir,
         pixeldrain_key=pd_key,
         work_dir=Path(args.work_dir),
-        source=args.source,
+        url_file=args.url_file,
+        custom_video_url=args.video_url,
         custom_torrent=args.torrent,
         audio_delay=args.delay,
         manual_audio_url=args.audio_url
