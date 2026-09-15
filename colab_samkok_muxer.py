@@ -89,6 +89,9 @@ def load_url_file(custom_path: Optional[str] = None) -> Dict[int, str]:
         Path("urleps8795.txt"),
         Path("/content/skym3u-downloader/urleps8795.json"),
         Path("/content/skym3u-downloader/urleps8795.txt"),
+        Path("/content/urleps8795.json"),
+        Path("/content/urleps8795.txt"),
+        Path("/root/urleps8795.txt"),
         Path("/root/skym3u-downloader/urleps8795.json"),
         Path("/root/skym3u-downloader/urleps8795.txt"),
         Path(__file__).parent / "urleps8795.json" if "__file__" in globals() else None,
@@ -99,7 +102,7 @@ def load_url_file(custom_path: Optional[str] = None) -> Dict[int, str]:
         if p and p.exists():
             try:
                 content = p.read_text(encoding="utf-8").strip()
-                # Try JSON format
+                # 1. Try JSON format
                 try:
                     data = json.loads(content)
                     if isinstance(data, dict):
@@ -110,18 +113,27 @@ def load_url_file(custom_path: Optional[str] = None) -> Dict[int, str]:
                 except Exception:
                     pass
 
-                # Try Line-by-line format
+                # 2. Try Line-by-line format
+                lines = [l.strip() for l in content.splitlines() if l.strip() and not l.strip().startswith("#")]
                 mapping = {}
-                for line in content.splitlines():
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
+                pure_urls = []
+                for line in lines:
                     m = re.match(r"^(\d+)\s*[:=\s]\s*(https?://\S+)", line)
                     if m:
                         mapping[int(m.group(1))] = m.group(2).strip()
+                    elif line.startswith("http"):
+                        pure_urls.append(line)
+
                 if mapping:
                     print(f"[+] Loaded {len(mapping)} direct episode URLs from '{p.name}'")
                     return mapping
+
+                if pure_urls:
+                    start_num = 87 if len(pure_urls) == 9 else 1
+                    mapping = {start_num + i: u for i, u in enumerate(pure_urls)}
+                    print(f"[+] Mapped {len(mapping)} sequential URLs starting from Episode {start_num} from '{p.name}'")
+                    return mapping
+
             except Exception as e:
                 print(f"[-] Warning parsing {p}: {e}", file=sys.stderr)
     return {}
@@ -431,7 +443,7 @@ def process_pipeline(
 
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
-    print(f"📡 1080p Video Source: Direct CDN URLs / Torrent Fallback")
+    print(f"📡 1080p Video Source: Direct CDN URLs (urleps8795.txt) / Torrent Fallback")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Lip Sync Padding)")
     if pixeldrain_key:
