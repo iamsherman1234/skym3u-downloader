@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Samkok 1080p Colab Remuxer & PixelDrain / GDrive Auto-Uploader
-Source: Jiang Hu 1080p HD (Direct CDN URLs from urleps8795.txt or Torrent) + TheKomsan Khmer Dub
+Samkok 1080p Complete 95-Episode Colab Pipeline & Auto-Uploader
+Source: Jiang Hu 1080p HD Direct CDN (urleps.json / urleps.txt) + TheKomsan Khmer Dub
 Features:
-- Fast multi-connection downloading via direct CDN links (urleps8795.txt) with auto-fallback to Torrent
+- Fast multi-threaded downloading for all 95 episodes via direct CDN links
+- Torrent fallback (samkok_1080p.torrent) if direct link is missing
 - Extracts Khmer AAC audio from TheKomsan (Rumble CDN)
-- Applies audio sync delay (+0.0s for Jiang Hu TV cut) and ad cutting
+- Applies audio sync delay (+0.0s for Jiang Hu TV cut) and ad cutting (Ep 1)
 - Losslessly remuxes into 1080p Dual Audio MKV with Chinese Subtitles / Original Audio
 - Auto-uploads directly to PixelDrain and/or mounted Google Drive
 - Sequential processing with immediate temp file cleanup (< 3 GB disk usage)
@@ -85,17 +86,24 @@ def load_url_file(custom_path: Optional[str] = None) -> Dict[int, str]:
     if custom_path:
         candidates.append(Path(custom_path))
     candidates.extend([
+        Path("urleps.json"),
+        Path("urleps.txt"),
         Path("urleps8795.json"),
         Path("urleps8795.txt"),
+        Path("/content/skym3u-downloader/urleps.json"),
+        Path("/content/skym3u-downloader/urleps.txt"),
         Path("/content/skym3u-downloader/urleps8795.json"),
         Path("/content/skym3u-downloader/urleps8795.txt"),
-        Path("/content/urleps8795.json"),
+        Path("/content/urleps.json"),
+        Path("/content/urleps.txt"),
         Path("/content/urleps8795.txt"),
         Path("/root/urleps8795.txt"),
+        Path("/root/skym3u-downloader/urleps.json"),
+        Path("/root/skym3u-downloader/urleps.txt"),
         Path("/root/skym3u-downloader/urleps8795.json"),
         Path("/root/skym3u-downloader/urleps8795.txt"),
-        Path(__file__).parent / "urleps8795.json" if "__file__" in globals() else None,
-        Path(__file__).parent / "urleps8795.txt" if "__file__" in globals() else None,
+        Path(__file__).parent / "urleps.json" if "__file__" in globals() else None,
+        Path(__file__).parent / "urleps.txt" if "__file__" in globals() else None,
     ])
 
     for p in candidates:
@@ -129,7 +137,7 @@ def load_url_file(custom_path: Optional[str] = None) -> Dict[int, str]:
                     return mapping
 
                 if pure_urls:
-                    start_num = 87 if len(pure_urls) == 9 else 1
+                    start_num = 1
                     mapping = {start_num + i: u for i, u in enumerate(pure_urls)}
                     print(f"[+] Mapped {len(mapping)} sequential URLs starting from Episode {start_num} from '{p.name}'")
                     return mapping
@@ -443,7 +451,7 @@ def process_pipeline(
 
     print(f"\n{'='*80}")
     print(f"🎬 Starting Samkok 1080p Colab Pipeline (Episodes {start_ep} to {end_ep})")
-    print(f"📡 1080p Video Source: Direct CDN URLs (urleps8795.txt) / Torrent Fallback")
+    print(f"📡 1080p Video Source: Direct CDN URLs ({len(url_map)} available) / Torrent Fallback")
     print(f"🎙️  Khmer Audio Source: TheKomsan / Rumble CDN (AAC Stereo)")
     print(f"⏱️  Audio Delay Applied: +{audio_delay:.3f}s (Lip Sync Padding)")
     if pixeldrain_key:
@@ -559,14 +567,14 @@ def main():
     parser = argparse.ArgumentParser(
         description="Google Colab 1080p Three Kingdoms Khmer Dub Remuxer (Direct CDN & Torrent)."
     )
-    parser.add_argument("-s", "--start", type=int, default=87, help="Starting episode number (default: 87)")
+    parser.add_argument("-s", "--start", type=int, default=1, help="Starting episode number (default: 1)")
     parser.add_argument("-e", "--end", type=int, default=95, help="Ending episode number (default: 95)")
     parser.add_argument("-p", "--pixeldrain", action="store_true", default=True, help="Enable PixelDrain auto-upload (default: True)")
     parser.add_argument("--no-pixeldrain", dest="pixeldrain", action="store_false", help="Disable PixelDrain auto-upload")
     parser.add_argument("--pixeldrain-key", type=str, default=DEFAULT_PIXELDRAIN_KEY, help="PixelDrain API key")
     parser.add_argument("-g", "--gdrive-dir", type=str, default="/content/drive/MyDrive/ThreeKingdoms_1080p_Khmer", help="Target Google Drive directory (or 'none')")
     parser.add_argument("-w", "--work-dir", type=str, default="/content/samkok_work", help="Working directory for temporary files")
-    parser.add_argument("--url-file", type=str, default=None, help="Custom path to URL mapping file (e.g. urleps8795.txt or urleps8795.json)")
+    parser.add_argument("--url-file", type=str, default=None, help="Custom path to URL mapping file (e.g. urleps.txt or urleps.json)")
     parser.add_argument("--video-url", type=str, default=None, help="Manual direct video URL override")
     parser.add_argument("--torrent", type=str, default=None, help="Path to .torrent file or magnet link fallback")
     parser.add_argument("--delay", type=float, default=0.0, help="Audio delay in seconds (default: 0.0)")
